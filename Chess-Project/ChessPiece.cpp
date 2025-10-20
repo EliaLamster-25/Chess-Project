@@ -55,28 +55,25 @@ ChessPiece::ChessPiece(bool isWhite, PieceType type, int square, const sf::Textu
     sprite.setScale(sf::Vector2f(0.5f, 0.5f));
 }
 
-void ChessPiece::draw(sf::RenderWindow& window, sf::Vector2u boardSize, int offsetX) {
-    int RectWidth  = static_cast<int>(boardSize.y / 8);
-    int RectHeight = RectWidth;
+void ChessPiece::draw(sf::RenderWindow& window, sf::Vector2u boardSize, int offsetX)
+{
+    const float rectW = static_cast<float>(boardSize.y) / 8.f;
+    const float rectH = rectW;
+    const float stepX = rectW * 0.95f;
+    const float stepY = rectH * 0.95f;
+    const float left  = offsetX * 1.06f;
+    const float top   = rectH * 0.20f;
 
-    // Match board perspective: flip only for multiplayer client, never in botmatch
-    bool flip = (!isNetworkHost.load(std::memory_order_acquire)
-                 && !isBotMatch.load(std::memory_order_acquire));
-    int disp = mapSquare(square, flip);
-    int file = toFile(disp);
-    int rank = toRank(disp);
+    const int f = toFile(square);       // DO NOT flip: no (7 - f)
+    const int r = toRank(square);
+    const float x = left + f * stepX;
+    const float y = top  + (7 - r) * stepY;
 
-    float squareX = RectWidth * file * 0.95f + offsetX * 1.06f;
-    float squareY = RectHeight * (7 - rank * 0.95f) - RectHeight * 0.15f;
+    const float cx = x + stepX / 2.f;
+    const float cy = y + stepY / 2.f;
 
-    float x = squareX + (RectWidth * 0.95f) / 2.f;
-    float y = squareY + (RectHeight * 0.95f) / 2.f;
-
-    sprite.setPosition(sf::Vector2f(x, y));
-
-    float pieceScale = (RectWidth * 0.6f) / 100.f;
-    sprite.setScale(sf::Vector2f(pieceScale, pieceScale));
-
+    // keep your scale logic if any
+    sprite.setPosition({cx, cy});
     window.draw(sprite);
 }
 

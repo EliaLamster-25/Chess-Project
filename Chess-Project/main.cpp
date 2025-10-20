@@ -382,6 +382,83 @@ void input(std::vector<ChessPiece*> piecePtrs) {
     }
 }
 
+static bool applyUciMoveLocal(const std::string& uci, std::vector<std::unique_ptr<ChessPiece>>& pieces) {
+    int fromSq = -1, toSq = -1; char promo = 0;
+    if (!parseUciMove(uci, fromSq, toSq, promo)) return false;
+
+    ChessPiece* mover = nullptr;
+    for (auto& up : pieces) {
+        if (up->getSquare() == fromSq && up->isWhite() == ChessPiece::whiteTurn) {
+            mover = up.get();
+            break;
+        }
+    }
+    if (!mover) {
+        std::cerr << "[AI] No piece at fromSq=" << fromSq << " for side "
+            << (ChessPiece::whiteTurn ? "white" : "black") << "\n";
+        return false;
+    }
+
+    // Castling: king moves two files on same rank -> slide rook
+    if (mover->getType() == PieceType::King &&
+        toRank(toSq) == toRank(fromSq) &&
+        std::abs(toFile(toSq) - toFile(fromSq)) == 2) {
+        bool kingSide = toFile(toSq) > toFile(fromSq);
+        int rnk = toRank(fromSq);
+        int rookFrom = toSquare(kingSide ? 7 : 0, rnk);
+        int rookTo = toSquare(kingSide ? 5 : 3, rnk);
+        for (auto& up : pieces) {
+            if (up->getSquare() == rookFrom &&
+                up->isWhite() == mover->isWhite() &&
+                up->getType() == PieceType::Rook) {
+                up->setSquare(rookTo);
+                up->setHasMoved(true);
+                break;
+            }
+        }
+    }
+
+    // Capture: normal or en passant
+    ChessPiece* targetEnemy = nullptr;
+    if (mover->getType() == PieceType::Pawn &&
+        toSq == ChessPiece::enPassantTargetSquare) {
+        int victimSq = toSq + (mover->isWhite() ? -8 : 8);
+        for (auto& up : pieces) {
+            if (up->getSquare() == victimSq &&
+                up->isWhite() != mover->isWhite() &&
+                up->getType() == PieceType::Pawn) {
+                targetEnemy = up.get();
+                break;
+            }
+        }
+    }
+    else {
+        for (auto& up : pieces) {
+            if (up->getSquare() == toSq &&
+                up->isWhite() != mover->isWhite()) {
+                targetEnemy = up.get();
+                break;
+            }
+        }
+    }
+    if (targetEnemy) targetEnemy->setSquare(-1);
+
+    // Move the piece
+    mover->setSquare(toSq);
+    mover->setHasMoved(true);
+
+    // En passant target for next move
+    ChessPiece::enPassantTargetSquare = -1;
+    if (mover->getType() == PieceType::Pawn && std::abs(toSq - fromSq) == 16) {
+        ChessPiece::enPassantTargetSquare = (fromSq + toSq) / 2;
+    }
+
+    // Promotion: optional – left for your existing promotion flow
+
+    ChessPiece::whiteTurn = !ChessPiece::whiteTurn;
+    return true;
+}
+
 std::atomic<bool> running{ true };
 
 void inputLoop(std::vector<ChessPiece*>& piecePtrs) {
@@ -389,6 +466,8 @@ void inputLoop(std::vector<ChessPiece*>& piecePtrs) {
         input(piecePtrs);
     }
 }
+
+bool stockfishTurn;
 
 int main()
 {
@@ -416,6 +495,10 @@ int main()
         // Handle error
         return 1;
     }
+
+    // Ensure a fresh game state
+    ChessPiece::whiteTurn = true;
+    ChessPiece::enPassantTargetSquare = -1;
 
     int offsetX = desktopMode.size.x / 4;
     sf::Vector2u boardSize = desktopMode.size;
@@ -488,18 +571,79 @@ int main()
             else if (currentState == State::Game_Singleplayer || currentState == State::Game_Multiplayer || currentState == State::Game_BotMatch) {
                 window.clear();
                 if (currentState == State::Game_Multiplayer || currentState == State::Game_BotMatch) {
-                        
+                    if (aifirstmove) {
+                        // Only do this for BotMatch client or Multiplayer host; here we care about BotMatch client
+                        if (!ChessPiece::whiteTurn) ChessPiece::whiteTurn = true;
+
+                        if (currentState == State::Game_BotMatch) {
+                            // Start fresh for each new BotMatch
+                            engine.reset();
+                        }
+
+                        std::string aiMove = engine.getNextMove(1000);
+                        std::cout << "Stockfish suggests move: " << aiMove << "\n";
+
+                        bool applied = false;
+                        if (!aiMove.empty() && aiMove != "(none)") {
+                            applied = applyUciMoveLocal(aiMove, pieces);
+                        }
+
+                        if (applied) {
+                            // In BotMatch, send to the server (host)
+                            if (currentState == State::Game_BotMatch) {
+                                networkManager.sendToHost(aiMove);
+                            }
+                            else if (isNetworkHost) {
+                                networkManager.sendToClient(aiMove);
+                            }
+                            else {
+                                networkManager.sendToHost(aiMove);
+                            }
+                            selectedPiece = nullptr;
+                            aifirstmove = false;
+                        }
+                        else {
+                            std::cerr << "[AI] Failed to apply opening move: " << aiMove << "\n";
+                        }
+                    }
                     json received_data;
                     networkManager.update();
                     if (isNetworkHost)
                     {
                         auto status = networkManager.receiveFromClient(received_data);
                         if (status == 1) {
-                            if (received_data.contains("start_square") && received_data["start_square"].is_number_integer() &&
-                                received_data.contains("end_square") && received_data["end_square"].is_number_integer()) {
-                                received_startSquare = received_data["start_square"].get<int>();
-                                received_endSquare = received_data["end_square"].get<int>();
-                                commandMove = true;
+                            if (currentState == State::Game_BotMatch && received_data.is_string()) {
+                                const std::string uci = received_data.get<std::string>();
+
+                                // Apply client's move immediately
+                                if (!applyUciMoveLocal(uci, pieces)) {
+                                    std::cerr << "Failed to apply client move: \"" << uci << "\"\n";
+                                } else {
+                                    // Tell engine the opponent just moved, then get and apply reply
+                                    engine.opponentMove(uci);
+                                    std::string reply = engine.getNextMove(1000);
+                                    std::cout << "Stockfish reply: " << reply << "\n";
+                                    if (!reply.empty() && reply != "(none)") {
+                                        if (applyUciMoveLocal(reply, pieces)) {
+                                            networkManager.sendToClient(reply);
+                                        } else {
+                                            std::cerr << "[AI] Failed to apply reply: " << reply << "\n";
+                                        }
+                                    }
+                                }
+
+                                // Clear any stale selection
+                                selectedPiece = nullptr;
+                            }
+                            else if (received_data.contains("start_square") && received_data["start_square"].is_number_integer() &&
+                                     received_data.contains("end_square") && received_data["end_square"].is_number_integer()) {
+                                const int fs = received_data["start_square"].get<int>();
+                                const int ts = received_data["end_square"].get<int>();
+                                const std::string uci = squareToString(fs) + squareToString(ts);
+                                if (!applyUciMoveLocal(uci, pieces)) {
+                                    std::cerr << "Failed to apply client move: " << uci << "\n";
+                                }
+                                selectedPiece = nullptr;
                             }
                             else {
                                 std::cerr << "Malformed move packet: " << received_data.dump() << "\n";
@@ -512,56 +656,59 @@ int main()
                         auto status = networkManager.receiveFromHost(received_data);
                         if (status == 1) {
                             if (currentState == State::Game_BotMatch && received_data.is_string()) {
-                                const std::string movetest = received_data.get<std::string>();
-                                const std::string move = flipMoveHoriz(received_data.get<std::string>());
-                                const std::string fromStrtest = movetest.size() >= 2 ? movetest.substr(0, 2) : "";
-                                const std::string toStrtest = movetest.size() >= 4 ? movetest.substr(2, 2) : "";
-                                const std::string fromStr = move.size() >= 2 ? move.substr(0, 2) : "";
-                                const std::string toStr = move.size() >= 4 ? move.substr(2, 2) : "";
-                                std::cout << "Bot plays: " << fromStrtest << toStrtest << "\n";
-                                std::cout << "Bot plays (flipped horizontal): " << fromStr << toStr << "\n";
-                                engine.opponentMove(move);
+                                const std::string uci = received_data.get<std::string>();
+                                std::cout << "[server->client] Black UCI: " << uci << "\n";
 
-                                auto parseAlgebraic = [](const std::string& tok) -> int {
-                                    if (tok.size() != 2) return -1;
-                                    char fileCh = static_cast<char>(std::tolower(static_cast<unsigned char>(tok[0])));
-                                    char rankCh = tok[1];
-                                    if (fileCh < 'a' || fileCh > 'h' || rankCh < '1' || rankCh > '8') return -1;
-                                    int file = fileCh - 'a';
-                                    int rank = rankCh - '1';
-                                    return rank * 8 + file;
-                                    };
+                                // Apply black move locally
+                                if (!applyUciMoveLocal(uci, pieces)) {
+                                    std::cerr << "Failed to apply host move: \"" << uci << "\"\n";
+                                } else {
+                                    // Tell local engine what black just played
+                                    engine.opponentMove(uci);
 
-                                received_startSquare = parseAlgebraic(fromStr);
-                                received_endSquare = parseAlgebraic(toStr);
-
-                                if (received_startSquare != -1 && received_endSquare != -1) {
-                                    commandMove = true;
+                                    if (!gameOver) {
+                                        // Get white reply from local Stockfish
+                                        std::string reply = engine.getNextMove(1000);
+                                        std::cout << "[client/Stockfish] White UCI: " << reply << "\n";
+                                        if (!reply.empty() && reply != "(none)") {
+                                            // Apply reply locally and send to server
+                                            if (applyUciMoveLocal(reply, pieces)) {
+                                                networkManager.sendToHost(reply);
+                                            } else {
+                                                std::cerr << "[AI] Failed to apply white reply: " << reply << "\n";
+                                            }
+                                        }
+                                    }
                                 }
-                                else {
-                                    std::cerr << "Malformed bot move string: \"" << move << "\"\n";
-                                }
-
-                                // right after you set received_startSquare/received_endSquare:
-                                std::cout << "[network] received move -> from=" << received_startSquare
-                                    << " to=" << received_endSquare
-                                    << " (json/type: " << (received_data.is_string() ? "string" : "object") << ")\n";
-
+                                selectedPiece = nullptr;
                             }
-                            else if (received_data.is_object()) {
-                                const std::string type = received_data.value("type", "");
-                                if (received_data.contains("start_square") && received_data["start_square"].is_number_integer() &&
-                                    received_data.contains("end_square") && received_data["end_square"].is_number_integer()) {
-                                    received_startSquare = received_data["start_square"].get<int>();
-                                    received_endSquare = received_data["end_square"].get<int>();
-                                    commandMove = true;
+                            else if (received_data.contains("start_square") && received_data["start_square"].is_number_integer() &&
+                                     received_data.contains("end_square") && received_data["end_square"].is_number_integer()) {
+                                const int fs = received_data["start_square"].get<int>();
+                                const int ts = received_data["end_square"].get<int>();
+                                const std::string uci = squareToString(fs) + squareToString(ts);
+
+                                if (!applyUciMoveLocal(uci, pieces)) {
+                                    std::cerr << "Failed to apply host move: " << uci << "\n";
+                                } else {
+                                    engine.opponentMove(uci);
+
+                                    if (!gameOver) {
+                                        std::string reply = engine.getNextMove(1000);
+                                        std::cout << "[client/Stockfish] White UCI: " << reply << "\n";
+                                        if (!reply.empty() && reply != "(none)") {
+                                            if (applyUciMoveLocal(reply, pieces)) {
+                                                networkManager.sendToHost(reply);
+                                            } else {
+                                                std::cerr << "[AI] Failed to apply white reply: " << reply << "\n";
+                                            }
+                                        }
+                                    }
                                 }
-                                else {
-                                    std::cerr << "Malformed move packet: " << received_data.dump() << "\n";
-                                }
+                                selectedPiece = nullptr;
                             }
                             else {
-                                std::cerr << "Unexpected JSON payload: " << received_data.dump() << "\n";
+                                std::cerr << "Malformed move packet: " << received_data.dump() << "\n";
                             }
                         }
                     }
@@ -863,8 +1010,7 @@ int main()
                     }
 
                     // Mouse released: attempt to apply move (enforcing safety)
-                    else if (event.is<sf::Event::MouseButtonReleased>() || commandMove || aifirstmove) {
-						std::cout << "aifirstmove" << aifirstmove;
+                    else if (event.is<sf::Event::MouseButtonReleased>() || commandMove) {
                         auto mouse = event.getIf<sf::Event::MouseButtonReleased>();
                         bool usingCommand = commandMove;
 
@@ -1128,8 +1274,8 @@ int main()
                             }
                         }
 
-                        std::string aiMove = engine.getNextMove(1000);
-						std::cout << "Stockfish suggests move: " << aiMove << "\n";
+                        //std::string aiMove = engine.getNextMove(1000);
+                        //std::cout << "Stockfish suggests move: " << aiMove << "\n";
                         //if (aiMove.size() >= 4) {
                         //    // aiMove is in UCI format, e.g., "e2e4"
                         //    auto algebraicToSquare = [](const std::string& s) -> int {
@@ -1144,7 +1290,7 @@ int main()
                         //    int toSq = algebraicToSquare(aiMove.substr(2, 2));
                         //    selectedPiece->setSquare(toSq);
                         //}
-                        selectedPiece->setSquare(targetSquare);
+                        //selectedPiece->setSquare(targetSquare);
                         // Mark piece as having moved (affects future castling rights)
                         selectedPiece->setHasMoved(true);
 
@@ -1172,9 +1318,9 @@ int main()
                                 networkManager.sendToClient(sent_data);
                             }
                             else if (currentState == State::Game_BotMatch) {
-                                // BotMatch client path: send algebraic (flipped) string to host/bot
-                                sent_data = flipMoveHoriz(squareToString(sent_startSquare) + squareToString(sent_endSquare));
-                                std::cout << sent_data << "\n";
+                                // BotMatch client path: send plain UCI (no flipping)
+                                sent_data = squareToString(sent_startSquare) + squareToString(sent_endSquare);
+                                std::cout << "[client->host] UCI: " << sent_data << "\n";
                                 networkManager.sendToHost(sent_data);
                             }
                             else {
@@ -1250,6 +1396,7 @@ int main()
                             selectedPiece->getSprite().setPosition(mouseF - dragOffset);
                         }
                     }
+
                 } // end event loop
 
                 chess.draw(window, boardSize);
@@ -1452,15 +1599,12 @@ int main()
                 //                            ChessPiece::whiteTurn = !ChessPiece::whiteTurn;
                 //                        }
                 //                    }
+                //                    else if (uci == "(none)") {
+                //                        // No legal moves (checkmate/stalemate); let the existing end-of-frame logic detect/end the game
+                //                    }
                 //                }
                 //            }
-                //            else if (uci == "(none)") {
-                //                // No legal moves (checkmate/stalemate); let the existing end-of-frame logic detect/end the game
-                //            }
-                //        }
-                //    }
-                //}
-            }
         }
+    }
     }
 }

@@ -200,10 +200,6 @@ void networkManager::update() {
             std::cout << "Client connected: "
                       << (remote.has_value() ? remote->toString() : "<unknown>")
                       << "\n";
-
-            json greeting;
-            greeting["message"] = "Welcome to the server!";
-            sendToClient(greeting);
         }
     }
 }
