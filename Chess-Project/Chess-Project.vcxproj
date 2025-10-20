@@ -100,16 +100,16 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>SFML_STATIC;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>C:\Users\elamster\Downloads\SFML-3.0.0-windows-vc17-64-bit\SFML-3.0.0\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>C:\Program Files\SFML\include</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>C:\Users\elamster\Downloads\SFML-3.0.0-windows-vc17-64-bit\SFML-3.0.0\lib</AdditionalLibraryDirectories>
-      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);sfml-graphics-d.lib;sfml-window-d.lib;sfml-network-d.lib;sfml-system-d.lib</AdditionalDependencies>
+      <AdditionalLibraryDirectories>C:\Program Files\SFML\lib</AdditionalLibraryDirectories>
+      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);sfml-graphics-s-d.lib;sfml-window-s-d.lib;sfml-network-s-d.lib;sfml-system-s-d.lib</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -118,28 +118,86 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>SFML_STATIC;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
-      <AdditionalIncludeDirectories>C:\Users\elamster\Downloads\SFML-3.0.0-windows-vc17-64-bit\SFML-3.0.0\include</AdditionalIncludeDirectories>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>C:\Program Files\SFML\include</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp17</LanguageStandard>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalLibraryDirectories>C:\Users\elamster\Downloads\SFML-3.0.0-windows-vc17-64-bit\SFML-3.0.0\lib</AdditionalLibraryDirectories>
-      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);sfml-system.lib;sfml-network.lib;sfml-window.lib;sfml-graphics.lib</AdditionalDependencies>
+      <AdditionalLibraryDirectories>C:\Program Files\SFML\lib</AdditionalLibraryDirectories>
+      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);sfml-system-s.lib;sfml-network-s.lib;sfml-window-s.lib;sfml-graphics-s.lib;winmm.lib;ws2_32.lib;opengl32.lib;gdi32.lib;freetype.lib</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="assets\chessPieces\blackBishop.cpp" />
+    <ClCompile Include="assets\chessPieces\blackKing.cpp" />
+    <ClCompile Include="assets\chessPieces\blackKnight.cpp" />
+    <ClCompile Include="assets\chessPieces\blackPawn.cpp" />
+    <ClCompile Include="assets\chessPieces\blackQueen.cpp" />
+    <ClCompile Include="assets\chessPieces\blackRook.cpp" />
+    <ClCompile Include="assets\chessPieces\whiteBishop.cpp" />
+    <ClCompile Include="assets\chessPieces\whiteKing.cpp" />
+    <ClCompile Include="assets\chessPieces\whiteKnight.cpp" />
+    <ClCompile Include="assets\chessPieces\whitePawn.cpp" />
+    <ClCompile Include="assets\chessPieces\whiteQueen.cpp" />
+    <ClCompile Include="assets\chessPieces\whiteRook.cpp" />
+    <ClCompile Include="assets\segoeuithibd_ttf.cpp" />
+    <ClCompile Include="assets\segoeuithis_ttf.cpp" />
+    <ClCompile Include="Bishop.cpp" />
     <ClCompile Include="ChessBoard.cpp" />
     <ClCompile Include="ChessPiece.cpp" />
+    <ClCompile Include="King.cpp" />
+    <ClCompile Include="Knight.cpp" />
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="Check-CheckMate.cpp" />
+    <ClCompile Include="mainMenu.cpp" />
+    <ClCompile Include="Network.cpp" />
+    <ClCompile Include="Pawn.cpp" />
+    <ClCompile Include="Positions.cpp" />
+    <ClCompile Include="Queen.cpp" />
+    <ClCompile Include="Rook.cpp" />
+    <ClCompile Include="RoundedRectangleShape.cpp" />
+    <ClCompile Include="stockfish.cpp" />
+    <ClCompile Include="textures.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="assets\chessPieces\blackBishop.h" />
+    <ClInclude Include="assets\chessPieces\blackKing.h" />
+    <ClInclude Include="assets\chessPieces\blackKnight.h" />
+    <ClInclude Include="assets\chessPieces\blackPawn.h" />
+    <ClInclude Include="assets\chessPieces\blackQueen.h" />
+    <ClInclude Include="assets\chessPieces\blackRook.h" />
+    <ClInclude Include="assets\chessPieces\ChessPiecesUmbrella.hpp" />
+    <ClInclude Include="assets\chessPieces\whiteBishop.h" />
+    <ClInclude Include="assets\chessPieces\whiteKing.h" />
+    <ClInclude Include="assets\chessPieces\whiteKnight.h" />
+    <ClInclude Include="assets\chessPieces\whitePawn.h" />
+    <ClInclude Include="assets\chessPieces\whiteQueen.h" />
+    <ClInclude Include="assets\chessPieces\whiteRook.h" />
+    <ClInclude Include="assets\segoeuithibd_ttf.h" />
+    <ClInclude Include="assets\segoeuithis_ttf.h" />
+    <ClInclude Include="Bishop.hpp" />
     <ClInclude Include="ChessBoard.hpp" />
     <ClInclude Include="ChessPiece.hpp" />
+    <ClInclude Include="conversion.hpp" />
+    <ClInclude Include="json.hpp" />
+    <ClInclude Include="King.hpp" />
+    <ClInclude Include="Knight.hpp" />
+    <ClInclude Include="Check-CheckMate.hpp" />
+    <ClInclude Include="main.hpp" />
+    <ClInclude Include="mainMenu.hpp" />
+    <ClInclude Include="Network.hpp" />
+    <ClInclude Include="Pawn.hpp" />
+    <ClInclude Include="Positions.hpp" />
+    <ClInclude Include="Promotion.hpp" />
+    <ClInclude Include="Queen.hpp" />
+    <ClInclude Include="Rook.hpp" />
+    <ClInclude Include="RoundedRectangleShape.hpp" />
+    <ClInclude Include="stockfish.hpp" />
+    <ClInclude Include="textures.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <ImportGroup Label="ExtensionTargets">
-  </ImportGroup>
+  <ImportGroup Label="ExtensionTargets" />
 </Project>

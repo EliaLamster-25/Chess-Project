@@ -1,91 +1,249 @@
-#include "ChessPiece.hpp"
 #include <cmath>
 #include <iostream>
+#include <memory>
+#include <string_view>
+#include <SFML/Graphics.hpp>
+#include <algorithm>
+#include <array>
 
-ChessPiece::ChessPiece(std::string type, sf::Vector2u boardSize, sf::Vector2u gridPos, const sf::Color& color)
-    : gridPosition(gridPos)
+#include "ChessPiece.hpp"
+#include "positions.hpp"
+#include "conversion.hpp"
+#include "Network.hpp"   // already present
+
+static const std::string_view whiteifyGlowFrag = std::string_view(R"(
+#version 120
+uniform sampler2D texture;
+uniform vec4 glowColor;
+void main()
 {
-	PieceType = type;
-    float cellSize = static_cast<float>(boardSize.y) / 8.f;
-    shape.setRadius(cellSize / 2.f * 0.8f); // slightly smaller than cell
-    shape.setFillColor(color);
+    vec4 pixel = texture2D(texture, gl_TexCoord[0].xy);
+    float alpha = pixel.a;
+    vec3 finalColor = glowColor.rgb;
+    gl_FragColor = vec4(finalColor, alpha * glowColor.a);
+}
+)");
+
+bool ChessPiece::whiteTurn = false;
+int ChessPiece::enPassantTargetSquare = -1;
+
+// Helper: map logical square to display square when flipped
+static inline int mapSquare(int sq, bool flip) {
+    return flip ? (63 - sq) : sq;          // full 180° rotation
+    // If you only wanted a horizontal mirror (files reversed):
+    // int f = sq % 8, r = sq / 8;
+    // return flip ? (r * 8 + (7 - f)) : sq;
 }
 
-void ChessPiece::handleEvent(const sf::Event& event, sf::RenderWindow& window, sf::Vector2u boardSize, int offsetX)
+ChessPiece::ChessPiece(bool isWhite, PieceType type, int square, const sf::Texture& texture)
+    : white(isWhite), type(type), square(square), sprite(texture), capturedSquare(-1)
 {
-    float cellSize = static_cast<float>(boardSize.y) / 8.f;
-    
-    if (event.is<sf::Event::MouseButtonPressed>()) {
-        auto mouse = sf::Mouse::getPosition(window);
-        sf::Vector2f mouseF(static_cast<float>(mouse.x), static_cast<float>(mouse.y));
+    sprite.setTexture(texture);
+    sprite.setOrigin(sf::Vector2f(texture.getSize().x / 2.f, texture.getSize().y / 2.f));
 
-        if (shape.getGlobalBounds().contains(mouseF)) {
-            isDragging = true;
-            dragOffset = mouseF - shape.getPosition();
-        }
-    }
-    else if (event.is<sf::Event::MouseButtonReleased>()) {
-        if (isDragging) {
-            isDragging = false;
+    // Match board perspective: flip only for multiplayer client, never in botmatch
+    bool flip = (!isNetworkHost.load(std::memory_order_acquire)
+                 && !isBotMatch.load(std::memory_order_acquire));
+    int disp = mapSquare(square, flip);
+    int file = disp % 8;
+    int rank = disp / 8;
 
-            auto pos = shape.getPosition();
-            unsigned gx = static_cast<unsigned>((pos.x - offsetX + cellSize / 2.f) / cellSize);
-            unsigned gy = static_cast<unsigned>((pos.y + cellSize / 2.f) / cellSize);
-
-            int ix = static_cast<int>(gx);
-            int iy = static_cast<int>(gy);
-
-            if (ix < 0 || ix > 7 || iy < 0 || iy > 7) {
-                if (ix < 0) ix = 0;
-                if (ix > 7) ix = 7;
-                if (iy < 0) iy = 0;
-                if (iy > 7) iy = 7;
-
-                int dxLeft = std::abs(ix - 0);
-                int dxRight = std::abs(ix - 7);
-                int dyTop = std::abs(iy - 0);
-                int dyBottom = std::abs(iy - 7);
-
-                int minDist = std::min({ dxLeft, dxRight, dyTop, dyBottom });
-
-                if (minDist == dxLeft) ix = 0;
-                else if (minDist == dxRight) ix = 7;
-                else if (minDist == dyTop) iy = 0;
-                else if (minDist == dyBottom) iy = 7;
-            }
-
-            gridPosition = { static_cast<unsigned>(ix), static_cast<unsigned>(iy) };
-        }
-
-    }
-    else if (event.is<sf::Event::MouseMoved>()) {
-        if (isDragging) {
-            sf::Vector2i mouseI = sf::Mouse::getPosition(window);
-            sf::Vector2f mouseF(static_cast<float>(mouseI.x), static_cast<float>(mouseI.y));
-
-            shape.setPosition(mouseF - dragOffset);
-        }
-    }
-
+    float cellSize = 80.f;
+    float x = file * cellSize + cellSize / 2.f;
+    float y = (7 - rank) * cellSize + cellSize / 2.f;
+    sprite.setPosition(sf::Vector2f(x, y));
+    sprite.setScale(sf::Vector2f(0.5f, 0.5f));
 }
 
-void ChessPiece::draw(sf::RenderWindow& surface, sf::Vector2u boardSize, int offsetX)
+void ChessPiece::draw(sf::RenderWindow& window, sf::Vector2u boardSize, int offsetX) {
+    int RectWidth  = static_cast<int>(boardSize.y / 8);
+    int RectHeight = RectWidth;
+
+    // Match board perspective: flip only for multiplayer client, never in botmatch
+    bool flip = (!isNetworkHost.load(std::memory_order_acquire)
+                 && !isBotMatch.load(std::memory_order_acquire));
+    int disp = mapSquare(square, flip);
+    int file = toFile(disp);
+    int rank = toRank(disp);
+
+    float squareX = RectWidth * file * 0.95f + offsetX * 1.06f;
+    float squareY = RectHeight * (7 - rank * 0.95f) - RectHeight * 0.15f;
+
+    float x = squareX + (RectWidth * 0.95f) / 2.f;
+    float y = squareY + (RectHeight * 0.95f) / 2.f;
+
+    sprite.setPosition(sf::Vector2f(x, y));
+
+    float pieceScale = (RectWidth * 0.6f) / 100.f;
+    sprite.setScale(sf::Vector2f(pieceScale, pieceScale));
+
+    window.draw(sprite);
+}
+
+void ChessPiece::setSquare(int sq) { square = sq; }
+int  ChessPiece::getSquare() const { return square; }
+bool ChessPiece::isWhite() const { return white; }
+sf::Sprite& ChessPiece::getSprite() { return sprite; }
+const sf::Sprite& ChessPiece::getSprite() const { return sprite; }
+
+bool ChessPiece::containsPoint(const sf::Vector2f& point) const {
+    return sprite.getGlobalBounds().contains(point);
+}
+
+std::string ChessPiece::pieceTypeToString(PieceType type) {
+    switch (type) {
+    case PieceType::King:   return "King";
+    case PieceType::Queen:  return "Queen";
+    case PieceType::Rook:   return "Rook";
+    case PieceType::Bishop: return "Bishop";
+    case PieceType::Knight: return "Knight";
+    case PieceType::Pawn:   return "Pawn";
+    default:                return "Unknown";
+    }
+}
+
+std::vector<int> ChessPiece::getPossibleMoves(const std::vector<int>& boardState) const {
+    std::vector<int> moves;
+    for (int i = 0; i < 64; i++) {
+        if (boardState[i] == 0) moves.push_back(i);
+    }
+    return moves;
+}
+
+void ChessPiece::drawPieceWithGlow(sf::RenderWindow& window,
+    const sf::Sprite& sprite,
+    sf::Color glow,
+    int glowSteps,
+    float maxScale,
+    float minAlphaFraction)
 {
-    if (!isDragging) {
-        float cellSize = static_cast<float>(boardSize.y) / 8.f;
+    // Pseudocode:
+    // - Validate texture; prepare shader once (colorize to glowColor with source alpha)
+    // - Compute on-screen sprite pixel size and a max glow radius (in pixels) from maxScale
+    // - Create a render texture large enough to hold the sprite plus glow padding
+    // - For ring from inner -> outer:
+    //     - r = lerp(0, outerRadiusPx)
+    //     - weight = minAlphaFraction + (1 - minAlphaFraction) * gaussian falloff
+    //     - For multiple directions around the circle (staggered per ring):
+    //         - offset = dir * r
+    //         - draw the sprite at (center + offset) using additive blending and the glow shader
+    // - Display the render texture and draw it to the window with alpha blending (halo)
+    // - Draw the original sprite on top
 
-        float x = static_cast<float>(offsetX)
-            + static_cast<float>(gridPosition.x) * cellSize
-            + cellSize * 0.1f;
-
-        float y = static_cast<float>(gridPosition.y) * cellSize
-            + cellSize * 0.1f;
-
-        sf::Vector2f position(x, y);
-
-        shape.setPosition(position);
+    if (glowSteps <= 0) {
+        window.draw(sprite);
+        return;
     }
 
-    surface.draw(shape);
+    static sf::Shader glowShader;
+    static bool shaderLoaded = false;
+    if (!shaderLoaded) {
+        shaderLoaded = glowShader.loadFromMemory(std::string_view{}, std::string_view{}, whiteifyGlowFrag);
+        // If shader fails, fall back to non-shader additive tinting
+    }
+
+    const sf::Texture* tex = &sprite.getTexture();
+    if (!tex) {
+        window.draw(sprite);
+        return;
+    }
+    const sf::Vector2u texSize = tex->getSize();
+    if (texSize.x == 0 || texSize.y == 0) {
+        window.draw(sprite);
+        return;
+    }
+
+    // On-screen pixel size of the sprite
+    const float scaleX = sprite.getScale().x;
+    const float scaleY = sprite.getScale().y;
+    const float spritePxW = static_cast<float>(texSize.x) * scaleX;
+    const float spritePxH = static_cast<float>(texSize.y) * scaleY;
+
+    // Interpret maxScale as how "thick" the glow can extend (relative to sprite size).
+    // Default maxScale=1.4f -> ~20% of max dimension as outer radius.
+    const float thicknessFactor = std::max(0.0f, maxScale - 1.0f);
+    const float outerRadiusPx = 0.5f * std::max(spritePxW, spritePxH) * (thicknessFactor * 0.5f + 0.1f);
+
+    // Pad around sprite to hold glow fully
+    const float pad = std::ceil(outerRadiusPx + 8.0f);
+    const unsigned rtW = static_cast<unsigned>(std::ceil(spritePxW + 2.0f * pad));
+    const unsigned rtH = static_cast<unsigned>(std::ceil(spritePxH + 2.0f * pad));
+
+    sf::RenderTexture rt(sf::Vector2u(rtW, rtH));
+    rt.clear(sf::Color::Transparent);
+
+    const sf::Vector2f rtCenter(rtW * 0.5f, rtH * 0.5f);
+
+    // Prepare a sprite aligned to the RT center
+    sf::Sprite s = sprite;
+    s.setOrigin(sf::Vector2f(texSize.x * 0.5f, texSize.y * 0.5f));
+    s.setScale(sf::Vector2f(scaleX, scaleY));
+    s.setPosition(rtCenter);
+
+    // Use additive blending for glow accumulation
+    sf::RenderStates glowStates;
+    glowStates.blendMode = sf::BlendAdd;
+    if (shaderLoaded) {
+        glowStates.shader = &glowShader;
+    }
+
+    // Softer falloff: Gaussian over radius, sampled with more directions and staggered angles
+    constexpr float PI = 3.14159265358979323846f;
+    constexpr int dirCount = 32; // more angular samples for smoothness
+    const float twoPi = 2.0f * PI;
+
+    // Gaussian sigma sized to produce a soft outer halo (tweakable)
+    const float sigma = std::max(outerRadiusPx * 0.6f, 1.0f);
+    minAlphaFraction = std::clamp(minAlphaFraction, 0.0f, 1.0f);
+
+    for (int ring = 1; ring <= glowSteps; ++ring) {
+        // Center the samples between 0..1 to avoid a hard outline near the outermost ring
+        const float t = std::clamp((static_cast<float>(ring) - 0.5f) / static_cast<float>(glowSteps), 0.0f, 1.0f);
+        const float r = t * outerRadiusPx;
+
+        // Gaussian falloff by distance
+        float g = std::exp(-(r * r) / (2.0f * sigma * sigma));
+        float weight = minAlphaFraction + (1.0f - minAlphaFraction) * g;
+        weight = std::clamp(weight, 0.0f, 1.0f);
+
+        sf::Color stepColor = glow;
+        stepColor.a = static_cast<std::uint8_t>(static_cast<float>(glow.a) * weight);
+
+        if (shaderLoaded) {
+            glowShader.setUniform("glowColor", sf::Glsl::Vec4(
+                stepColor.r / 255.f, stepColor.g / 255.f, stepColor.b / 255.f, stepColor.a / 255.f
+            ));
+        } else {
+            // Fallback: tint sprite color (still additive)
+            s.setColor(stepColor);
+        }
+
+        // Stagger angles every other ring to break directional banding
+        const float angleOffset = (ring & 1) ? (PI / static_cast<float>(dirCount)) : 0.0f;
+
+        for (int d = 0; d < dirCount; ++d) {
+            const float angle = angleOffset + (twoPi * (static_cast<float>(d) / static_cast<float>(dirCount)));
+            const sf::Vector2f offset(std::cos(angle) * r, std::sin(angle) * r);
+            s.setPosition(rtCenter + offset);
+            rt.draw(s, glowStates);
+        }
+    }
+
+    rt.display();
+
+    // Draw halo (use alpha blending to preserve hue) then the original sprite on top
+    sf::Sprite halo(rt.getTexture());
+    halo.setOrigin(sf::Vector2f(rtW * 0.5f, rtH * 0.5f));
+    halo.setPosition(sprite.getPosition());
+    halo.setScale(sf::Vector2f(1.0f, 1.0f));
+
+    sf::RenderStates haloStates;
+    haloStates.blendMode = sf::BlendAlpha; // preserves piece colors
+    window.draw(halo, haloStates);
+
+    // Finally, draw the original piece
+    window.draw(sprite);
 }
+
+ChessPiece::~ChessPiece() = default;
 
