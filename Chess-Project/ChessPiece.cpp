@@ -27,12 +27,12 @@ void main()
 bool ChessPiece::whiteTurn = false;
 int ChessPiece::enPassantTargetSquare = -1;
 
-// Helper: map logical square to display square when flipped
+// Helper: map logical square to display square when horizontally flipped (mirror files only)
 static inline int mapSquare(int sq, bool flip) {
-    return flip ? (63 - sq) : sq;          // full 180° rotation
-    // If you only wanted a horizontal mirror (files reversed):
-    // int f = sq % 8, r = sq / 8;
-    // return flip ? (r * 8 + (7 - f)) : sq;
+    if (!flip) return sq;
+    int file = sq % 8;
+    int rank = sq / 8;
+    return rank * 8 + (7 - file);
 }
 
 ChessPiece::ChessPiece(bool isWhite, PieceType type, int square, const sf::Texture& texture)
@@ -41,7 +41,7 @@ ChessPiece::ChessPiece(bool isWhite, PieceType type, int square, const sf::Textu
     sprite.setTexture(texture);
     sprite.setOrigin(sf::Vector2f(texture.getSize().x / 2.f, texture.getSize().y / 2.f));
 
-    // Match board perspective: flip only for multiplayer client, never in botmatch
+    // Match board perspective: mirror horizontally for multiplayer client, never in botmatch
     bool flip = (!isNetworkHost.load(std::memory_order_acquire)
                  && !isBotMatch.load(std::memory_order_acquire));
     int disp = mapSquare(square, flip);
@@ -64,15 +64,19 @@ void ChessPiece::draw(sf::RenderWindow& window, sf::Vector2u boardSize, int offs
     const float left  = offsetX * 1.06f;
     const float top   = rectH * 0.20f;
 
-    const int f = toFile(square);       // DO NOT flip: no (7 - f)
-    const int r = toRank(square);
+    // Use the same flip rule as the board so pieces align when mirrored
+    bool blackPerspective = (!isNetworkHost.load(std::memory_order_acquire)
+                             && !isBotMatch.load(std::memory_order_acquire));
+    const int displaySquare = mapSquare(square, blackPerspective);
+
+    const int f = toFile(displaySquare);
+    const int r = toRank(displaySquare);
     const float x = left + f * stepX;
     const float y = top  + (7 - r) * stepY;
 
     const float cx = x + stepX / 2.f;
     const float cy = y + stepY / 2.f;
 
-    // keep your scale logic if any
     sprite.setPosition({cx, cy});
     window.draw(sprite);
 }
@@ -114,19 +118,6 @@ void ChessPiece::drawPieceWithGlow(sf::RenderWindow& window,
     float maxScale,
     float minAlphaFraction)
 {
-    // Pseudocode:
-    // - Validate texture; prepare shader once (colorize to glowColor with source alpha)
-    // - Compute on-screen sprite pixel size and a max glow radius (in pixels) from maxScale
-    // - Create a render texture large enough to hold the sprite plus glow padding
-    // - For ring from inner -> outer:
-    //     - r = lerp(0, outerRadiusPx)
-    //     - weight = minAlphaFraction + (1 - minAlphaFraction) * gaussian falloff
-    //     - For multiple directions around the circle (staggered per ring):
-    //         - offset = dir * r
-    //         - draw the sprite at (center + offset) using additive blending and the glow shader
-    // - Display the render texture and draw it to the window with alpha blending (halo)
-    // - Draw the original sprite on top
-
     if (glowSteps <= 0) {
         window.draw(sprite);
         return;
@@ -136,7 +127,6 @@ void ChessPiece::drawPieceWithGlow(sf::RenderWindow& window,
     static bool shaderLoaded = false;
     if (!shaderLoaded) {
         shaderLoaded = glowShader.loadFromMemory(std::string_view{}, std::string_view{}, whiteifyGlowFrag);
-        // If shader fails, fall back to non-shader additive tinting
     }
 
     const sf::Texture* tex = &sprite.getTexture();
@@ -150,18 +140,14 @@ void ChessPiece::drawPieceWithGlow(sf::RenderWindow& window,
         return;
     }
 
-    // On-screen pixel size of the sprite
     const float scaleX = sprite.getScale().x;
     const float scaleY = sprite.getScale().y;
     const float spritePxW = static_cast<float>(texSize.x) * scaleX;
     const float spritePxH = static_cast<float>(texSize.y) * scaleY;
 
-    // Interpret maxScale as how "thick" the glow can extend (relative to sprite size).
-    // Default maxScale=1.4f -> ~20% of max dimension as outer radius.
     const float thicknessFactor = std::max(0.0f, maxScale - 1.0f);
     const float outerRadiusPx = 0.5f * std::max(spritePxW, spritePxH) * (thicknessFactor * 0.5f + 0.1f);
 
-    // Pad around sprite to hold glow fully
     const float pad = std::ceil(outerRadiusPx + 8.0f);
     const unsigned rtW = static_cast<unsigned>(std::ceil(spritePxW + 2.0f * pad));
     const unsigned rtH = static_cast<unsigned>(std::ceil(spritePxH + 2.0f * pad));
@@ -171,51 +157,41 @@ void ChessPiece::drawPieceWithGlow(sf::RenderWindow& window,
 
     const sf::Vector2f rtCenter(rtW * 0.5f, rtH * 0.5f);
 
-    // Prepare a sprite aligned to the RT center
     sf::Sprite s = sprite;
     s.setOrigin(sf::Vector2f(texSize.x * 0.5f, texSize.y * 0.5f));
     s.setScale(sf::Vector2f(scaleX, scaleY));
     s.setPosition(rtCenter);
 
-    // Use additive blending for glow accumulation
     sf::RenderStates glowStates;
-    glowStates.blendMode = sf::BlendAdd;
+    // Use alpha blending to avoid additive brightening/whitening in the center
+    glowStates.blendMode = sf::BlendAlpha;
     if (shaderLoaded) {
         glowStates.shader = &glowShader;
     }
 
-    // Softer falloff: Gaussian over radius, sampled with more directions and staggered angles
     constexpr float PI = 3.14159265358979323846f;
-    constexpr int dirCount = 32; // more angular samples for smoothness
+    constexpr int dirCount = 32;
     const float twoPi = 2.0f * PI;
 
-    // Gaussian sigma sized to produce a soft outer halo (tweakable)
-    const float sigma = std::max(outerRadiusPx * 0.6f, 1.0f);
+    // Clamp and use a uniform alpha across all rings (no Gaussian ramp)
     minAlphaFraction = std::clamp(minAlphaFraction, 0.0f, 1.0f);
+    const float uniformWeight = (minAlphaFraction > 0.0f) ? minAlphaFraction : 1.0f;
 
     for (int ring = 1; ring <= glowSteps; ++ring) {
-        // Center the samples between 0..1 to avoid a hard outline near the outermost ring
         const float t = std::clamp((static_cast<float>(ring) - 0.5f) / static_cast<float>(glowSteps), 0.0f, 1.0f);
         const float r = t * outerRadiusPx;
 
-        // Gaussian falloff by distance
-        float g = std::exp(-(r * r) / (2.0f * sigma * sigma));
-        float weight = minAlphaFraction + (1.0f - minAlphaFraction) * g;
-        weight = std::clamp(weight, 0.0f, 1.0f);
-
         sf::Color stepColor = glow;
-        stepColor.a = static_cast<std::uint8_t>(static_cast<float>(glow.a) * weight);
+        stepColor.a = static_cast<std::uint8_t>(static_cast<float>(glow.a) * uniformWeight);
 
         if (shaderLoaded) {
             glowShader.setUniform("glowColor", sf::Glsl::Vec4(
                 stepColor.r / 255.f, stepColor.g / 255.f, stepColor.b / 255.f, stepColor.a / 255.f
             ));
         } else {
-            // Fallback: tint sprite color (still additive)
             s.setColor(stepColor);
         }
 
-        // Stagger angles every other ring to break directional banding
         const float angleOffset = (ring & 1) ? (PI / static_cast<float>(dirCount)) : 0.0f;
 
         for (int d = 0; d < dirCount; ++d) {
@@ -228,17 +204,15 @@ void ChessPiece::drawPieceWithGlow(sf::RenderWindow& window,
 
     rt.display();
 
-    // Draw halo (use alpha blending to preserve hue) then the original sprite on top
     sf::Sprite halo(rt.getTexture());
     halo.setOrigin(sf::Vector2f(rtW * 0.5f, rtH * 0.5f));
     halo.setPosition(sprite.getPosition());
     halo.setScale(sf::Vector2f(1.0f, 1.0f));
 
     sf::RenderStates haloStates;
-    haloStates.blendMode = sf::BlendAlpha; // preserves piece colors
+    haloStates.blendMode = sf::BlendAlpha;
     window.draw(halo, haloStates);
 
-    // Finally, draw the original piece
     window.draw(sprite);
 }
 

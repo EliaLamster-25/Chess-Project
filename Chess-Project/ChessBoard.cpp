@@ -2,8 +2,11 @@
 
 namespace {
     inline int logicalToDisplaySquare(int sq, bool blackPerspective) {
-        // 180° rotation: file' = 7 - file, rank' = 7 - rank -> square' = 63 - sq
-        return blackPerspective ? (63 - sq) : sq;
+        // Horizontal mirror: same rank, file' = 7 - file
+        if (!blackPerspective) return sq;
+        int file = sq % 8;
+        int rank = sq / 8;
+        return rank * 8 + (7 - file);
     }
     inline int logicalFile(int sq) { return sq % 8; }
     inline int logicalRank(int sq) { return sq / 8; }
@@ -109,10 +112,8 @@ namespace {
 
         // Files
         for (int displayFile = 0; displayFile < 8; ++displayFile) {
-            int fileLetterIndex = blackPerspective ? displayFile : (7 - displayFile);
-            // If you want black to see a-h left->right (normal from their POV), invert logic:
-            // int fileLetterIndex = blackPerspective ? (7 - displayFile) : displayFile;
-            // Choose one; below makes bottom perspective always a-h left->right for the side at bottom.
+            // Make bottom perspective always a-h left->right for the side at bottom.
+            int fileLetterIndex = blackPerspective ? (7 - displayFile) : displayFile;
             char fileChar = static_cast<char>('a' + fileLetterIndex);
             std::string fileStr(1, fileChar);
 
@@ -140,7 +141,7 @@ namespace {
 
         // Ranks
         for (int displayRank = 0; displayRank < 8; ++displayRank) {
-            int rankNumberIndex = blackPerspective ? (7 - displayRank) : displayRank;
+            int rankNumberIndex = displayRank; // horizontal flip keeps rank order
             int rankNum = rankNumberIndex + 1;
             std::string rankStr = std::to_string(rankNum);
 
@@ -193,7 +194,7 @@ void ChessBoard::draw(sf::RenderWindow& surface, sf::Vector2u size) {
 
     // Only flip for multiplayer clients; never flip in bot matches
     bool blackPerspective = (!isNetworkHost.load(std::memory_order_acquire)
-                             && !isBotMatch.load(std::memory_order_acquire)); // CHANGED
+                             && !isBotMatch.load(std::memory_order_acquire));
 
     if (paramsChanged(cache, RectWidth, RectHeight, OffsetX, LabelPad, blackPerspective)) {
         buildBoardCache(cache, coordFont, RectWidth, RectHeight, OffsetX, LabelPad, blackPerspective);

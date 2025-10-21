@@ -7,6 +7,10 @@ enum class State { Menu, Game_Singleplayer, Game_Multiplayer, Game_BotMatch };
 
 bool aifirstmove;
 
+ChessPiece* selectedPiece = nullptr;
+
+constexpr int kEngineMoveTimeMs = 150; // tweak between 50..200 for responsiveness
+
 //json json_game;
 
 State currentState;
@@ -54,6 +58,81 @@ static std::optional<std::pair<PieceType, bool>> parsePieceLabel(std::string_vie
 
     bool isWhite = (colorStr == "white");
     return std::make_pair(*pt, isWhite);
+}
+
+
+// Horizontal mirror helpers (A<->H), keep ranks unchanged.
+
+// Map a 0..63 square to its horizontally mirrored square.
+// This is rank*8 + (7 - file), which is equivalent to sq ^ 7.
+static inline int flipSquareHoriz(int sq) {
+    return (sq >= 0 && sq < 64) ? (sq ^ 7) : sq;
+}
+
+// Flip a boardState (vector<int> size 64) horizontally in-place.
+static void flipBoardStateHoriz(std::vector<int>& board) {
+    if (board.size() != 64) return;
+    std::vector<int> flipped(64, 0);
+    for (int sq = 0; sq < 64; ++sq) {
+        const int fsq = flipSquareHoriz(sq);
+        flipped[fsq] = board[sq];
+    }
+    board.swap(flipped);
+}
+
+// Flip all piece squares horizontally (off-board pieces stay off).
+// Also flips ChessPiece::enPassantTargetSquare if set.
+static void flipPiecesHoriz(std::vector<std::unique_ptr<ChessPiece>>& piecesRef) {
+    for (auto& up : piecesRef) {
+        if (!up) continue;
+        const int sq = up->getSquare();
+        if (sq >= 0 && sq < 64) {
+            up->setSquare(flipSquareHoriz(sq));
+        }
+        // If you track a captured-square indicator for visuals, mirror that too.
+        const int cap = up->getCapturedSquare();
+        if (cap >= 0 && cap < 64) {
+            up->setCapturedSquare(flipSquareHoriz(cap));
+        }
+    }
+    if (ChessPiece::enPassantTargetSquare >= 0 && ChessPiece::enPassantTargetSquare < 64) {
+        ChessPiece::enPassantTargetSquare = flipSquareHoriz(ChessPiece::enPassantTargetSquare);
+    }
+}
+
+// Flip a UCI move horizontally (e.g., "a2a4" -> "h2h4"). Promotion letter is preserved.
+static std::string flipUciHoriz(const std::string& uci) {
+    if (uci.size() < 4) return uci;
+    auto flipFileChar = [](char f) -> char {
+        if (f < 'a' || f > 'h') return f;
+        return static_cast<char>('a' + (7 - (f - 'a')));
+        };
+    std::string r = uci;
+    r[0] = flipFileChar(static_cast<char>(std::tolower(static_cast<unsigned char>(r[0]))));
+    r[2] = flipFileChar(static_cast<char>(std::tolower(static_cast<unsigned char>(r[2]))));
+    return r;
+}
+
+// Flip a 64-bit bitboard horizontally (reverse bits inside each 8-bit rank).
+// This mirrors files A<->H for the conventional a1=LSB layout.
+static inline std::uint64_t flipBitboardHoriz(std::uint64_t bb) {
+    const std::uint64_t k1 = 0x5555555555555555ULL; // swap adjacent bits
+    const std::uint64_t k2 = 0x3333333333333333ULL; // swap pairs
+    const std::uint64_t k4 = 0x0f0f0f0f0f0f0f0fULL; // swap nibbles
+    bb = ((bb >> 1) & k1) | ((bb & k1) << 1);
+    bb = ((bb >> 2) & k2) | ((bb & k2) << 2);
+    bb = ((bb >> 4) & k4) | ((bb & k4) << 4);
+    return bb;
+}
+
+static void flipPositionHoriz(std::vector<std::unique_ptr<ChessPiece>>& piecesRef,
+    std::vector<int>& boardStateRef) {
+    flipPiecesHoriz(piecesRef);
+    flipBoardStateHoriz(boardStateRef);
+
+    // Clear transient UI state so the next frame rebuilds it coherently.
+    selectedPiece = nullptr;
+    // If you keep other per-frame overlays, let the next frame recompute them.
 }
 
 // Find the first matching piece (optionally at a given square)
@@ -122,9 +201,9 @@ static bool parseUciMove(const std::string& uci, int& fromSq, int& toSq, char& p
         int file = f - 'a';
         int rank = r - '1';
         return rank * 8 + file;
-    };
+        };
     fromSq = toSqIndex(uci[0], uci[1]);
-    toSq   = toSqIndex(uci[2], uci[3]);
+    toSq = toSqIndex(uci[2], uci[3]);
     promo = (uci.size() >= 5) ? static_cast<char>(std::tolower(static_cast<unsigned char>(uci[4]))) : 0;
     return fromSq >= 0 && toSq >= 0;
 }
@@ -144,7 +223,7 @@ static std::string makeFEN(const std::vector<std::unique_ptr<ChessPiece>>& piece
         case PieceType::King:   c = 'k'; break;
         }
         return p.isWhite() ? static_cast<char>(std::toupper(static_cast<unsigned char>(c))) : c;
-    };
+        };
 
     for (auto& up : pieces) {
         int s = up->getSquare();
@@ -159,7 +238,8 @@ static std::string makeFEN(const std::vector<std::unique_ptr<ChessPiece>>& piece
             int idx = rank * 8 + file;
             if (board[idx] == 0) {
                 ++empty;
-            } else {
+            }
+            else {
                 if (empty > 0) { fen << empty; empty = 0; }
                 fen << board[idx];
             }
@@ -183,11 +263,13 @@ static std::string makeFEN(const std::vector<std::unique_ptr<ChessPiece>>& piece
         if (s < 0 || s > 63) continue;
         if (up->getType() == PieceType::King) {
             if (up->isWhite()) wKing = up.get(); else bKing = up.get();
-        } else if (up->getType() == PieceType::Rook) {
+        }
+        else if (up->getType() == PieceType::Rook) {
             if (up->isWhite()) {
                 if (s == toSquare(0, 0)) wRookA1 = up.get();
                 if (s == toSquare(7, 0)) wRookH1 = up.get();
-            } else {
+            }
+            else {
                 if (s == toSquare(0, 7)) bRookA8 = up.get();
                 if (s == toSquare(7, 7)) bRookH8 = up.get();
             }
@@ -211,7 +293,8 @@ static std::string makeFEN(const std::vector<std::unique_ptr<ChessPiece>>& piece
     // En passant target
     if (ChessPiece::enPassantTargetSquare >= 0 && ChessPiece::enPassantTargetSquare < 64) {
         fen << squareToAlgebraic(ChessPiece::enPassantTargetSquare);
-    } else {
+    }
+    else {
         fen << '-';
     }
 
@@ -321,7 +404,6 @@ std::string getBotUciMove(const std::vector<std::unique_ptr<ChessPiece>>& pieces
     return squareToAlgebraic(fromSq) + squareToAlgebraic(toSq) + promo;
 }
 
-ChessPiece* selectedPiece = nullptr;
 int received_startSquare = -1;
 int received_endSquare = -1;
 int sent_startSquare = -1;
@@ -329,7 +411,7 @@ int sent_endSquare = -1;
 
 bool commandMove = false;
 
-void setState (State state) {
+void setState(State state) {
     currentState = state;
 }
 
@@ -364,20 +446,21 @@ void input(std::vector<ChessPiece*> piecePtrs) {
             }
         }
         return -1;
-    };
+        };
 
     if (!startToken.empty()) received_startSquare = parseSquare(startToken);
     if (!endToken.empty())   received_endSquare = parseSquare(endToken);
 
     // Only arm the command when squares are valid
     if (received_startSquare >= 0 && received_startSquare < 64 &&
-        received_endSquare   >= 0 && received_endSquare   < 64) {
+        received_endSquare >= 0 && received_endSquare < 64) {
         commandMove = true;
         json data;
         //data["start_square"] = received_startSquare;
         //data["end_square"] = received_endSquare;
      //   std::cout << "JSON: " << data["start_square"] << "\n";
-    } else {
+    }
+    else {
         std::cout << "Invalid squares. Use 0..63 or algebraic (e.g., e2 e4).\n";
     }
 }
@@ -453,7 +536,6 @@ static bool applyUciMoveLocal(const std::string& uci, std::vector<std::unique_pt
         ChessPiece::enPassantTargetSquare = (fromSq + toSq) / 2;
     }
 
-    // Promotion: optional – left for your existing promotion flow
 
     ChessPiece::whiteTurn = !ChessPiece::whiteTurn;
     return true;
@@ -466,6 +548,11 @@ void inputLoop(std::vector<ChessPiece*>& piecePtrs) {
         input(piecePtrs);
     }
 }
+
+// Defer engine reply by one frame so we render between moves
+enum class ReplyRoute { None, ToClient, ToHost };
+static ReplyRoute engineReplyRoute = ReplyRoute::None;
+static bool engineReplyScheduled = false;
 
 bool stockfishTurn;
 
@@ -490,7 +577,7 @@ int main()
     textureManager.loadTextures(pieces);
 
     StockfishEngine engine(L"C:/Users/elamster/Downloads/stockfish-windows-x86-64-avx2/stockfish/stockfish.exe");  // Note the L prefix for wide string literal
-	aifirstmove = true;
+    aifirstmove = true;
     if (!engine.initialize()) {
         // Handle error
         return 1;
@@ -517,6 +604,8 @@ int main()
 
     std::thread networkThread;          // default-constructed, not joinable yet
     bool networkThreadStarted = false;
+
+    flipPiecesHoriz(pieces);
 
     while (window.isOpen())
     {
@@ -566,11 +655,32 @@ int main()
                 chess.draw(window, boardSize);
                 menu.draw(window);
                 window.display();
+                sf::sleep(sf::milliseconds(1));
                 continue;
             }
             else if (currentState == State::Game_Singleplayer || currentState == State::Game_Multiplayer || currentState == State::Game_BotMatch) {
                 window.clear();
-                if (currentState == State::Game_Multiplayer || currentState == State::Game_BotMatch) {
+                if (currentState == State::Game_BotMatch && engineReplyScheduled && !gameOver) {
+                    std::string reply = engine.getNextMove(kEngineMoveTimeMs);
+                    std::cout << "Stockfish reply (deferred): " << reply << "\n";
+                    if (!reply.empty() && reply != "(none)") {
+                        if (applyUciMoveLocal(reply, pieces)) {
+                            if (engineReplyRoute == ReplyRoute::ToClient) {
+                                networkManager.sendToClient(reply);
+                            }
+                            else if (engineReplyRoute == ReplyRoute::ToHost) {
+                                networkManager.sendToHost(reply);
+                            }
+                        }
+                        else {
+                            std::cerr << "[AI] Failed to apply deferred reply: " << reply << "\n";
+                        }
+                    }
+                    selectedPiece = nullptr;
+                    engineReplyScheduled = false;
+                    engineReplyRoute = ReplyRoute::None;
+                }
+                else if (currentState == State::Game_Multiplayer || currentState == State::Game_BotMatch) {
                     if (aifirstmove) {
                         // Only do this for BotMatch client or Multiplayer host; here we care about BotMatch client
                         if (!ChessPiece::whiteTurn) ChessPiece::whiteTurn = true;
@@ -580,7 +690,7 @@ int main()
                             engine.reset();
                         }
 
-                        std::string aiMove = engine.getNextMove(1000);
+                        std::string aiMove = engine.getNextMove(kEngineMoveTimeMs);
                         std::cout << "Stockfish suggests move: " << aiMove << "\n";
 
                         bool applied = false;
@@ -618,25 +728,20 @@ int main()
                                 // Apply client's move immediately
                                 if (!applyUciMoveLocal(uci, pieces)) {
                                     std::cerr << "Failed to apply client move: \"" << uci << "\"\n";
-                                } else {
+                                }
+                                else {
                                     // Tell engine the opponent just moved, then get and apply reply
+                                    // Tell engine the opponent just moved; schedule reply next frame
                                     engine.opponentMove(uci);
-                                    std::string reply = engine.getNextMove(1000);
-                                    std::cout << "Stockfish reply: " << reply << "\n";
-                                    if (!reply.empty() && reply != "(none)") {
-                                        if (applyUciMoveLocal(reply, pieces)) {
-                                            networkManager.sendToClient(reply);
-                                        } else {
-                                            std::cerr << "[AI] Failed to apply reply: " << reply << "\n";
-                                        }
-                                    }
+                                    engineReplyScheduled = true;
+                                    engineReplyRoute = ReplyRoute::ToClient;
                                 }
 
                                 // Clear any stale selection
                                 selectedPiece = nullptr;
                             }
                             else if (received_data.contains("start_square") && received_data["start_square"].is_number_integer() &&
-                                     received_data.contains("end_square") && received_data["end_square"].is_number_integer()) {
+                                received_data.contains("end_square") && received_data["end_square"].is_number_integer()) {
                                 const int fs = received_data["start_square"].get<int>();
                                 const int ts = received_data["end_square"].get<int>();
                                 const std::string uci = squareToString(fs) + squareToString(ts);
@@ -662,44 +767,38 @@ int main()
                                 // Apply black move locally
                                 if (!applyUciMoveLocal(uci, pieces)) {
                                     std::cerr << "Failed to apply host move: \"" << uci << "\"\n";
-                                } else {
+                                }
+                                else {
                                     // Tell local engine what black just played
+                                    // Tell local engine what black just played; schedule white reply next frame
                                     engine.opponentMove(uci);
-
                                     if (!gameOver) {
-                                        // Get white reply from local Stockfish
-                                        std::string reply = engine.getNextMove(1000);
-                                        std::cout << "[client/Stockfish] White UCI: " << reply << "\n";
-                                        if (!reply.empty() && reply != "(none)") {
-                                            // Apply reply locally and send to server
-                                            if (applyUciMoveLocal(reply, pieces)) {
-                                                networkManager.sendToHost(reply);
-                                            } else {
-                                                std::cerr << "[AI] Failed to apply white reply: " << reply << "\n";
-                                            }
-                                        }
+                                        engineReplyScheduled = true;
+                                        engineReplyRoute = ReplyRoute::ToHost;
                                     }
                                 }
                                 selectedPiece = nullptr;
                             }
                             else if (received_data.contains("start_square") && received_data["start_square"].is_number_integer() &&
-                                     received_data.contains("end_square") && received_data["end_square"].is_number_integer()) {
+                                received_data.contains("end_square") && received_data["end_square"].is_number_integer()) {
                                 const int fs = received_data["start_square"].get<int>();
                                 const int ts = received_data["end_square"].get<int>();
                                 const std::string uci = squareToString(fs) + squareToString(ts);
 
                                 if (!applyUciMoveLocal(uci, pieces)) {
                                     std::cerr << "Failed to apply host move: " << uci << "\n";
-                                } else {
+                                }
+                                else {
                                     engine.opponentMove(uci);
 
                                     if (!gameOver) {
-                                        std::string reply = engine.getNextMove(1000);
+                                        std::string reply = engine.getNextMove(kEngineMoveTimeMs);
                                         std::cout << "[client/Stockfish] White UCI: " << reply << "\n";
                                         if (!reply.empty() && reply != "(none)") {
                                             if (applyUciMoveLocal(reply, pieces)) {
                                                 networkManager.sendToHost(reply);
-                                            } else {
+                                            }
+                                            else {
                                                 std::cerr << "[AI] Failed to apply white reply: " << reply << "\n";
                                             }
                                         }
@@ -1274,23 +1373,9 @@ int main()
                             }
                         }
 
-                        //std::string aiMove = engine.getNextMove(1000);
-                        //std::cout << "Stockfish suggests move: " << aiMove << "\n";
-                        //if (aiMove.size() >= 4) {
-                        //    // aiMove is in UCI format, e.g., "e2e4"
-                        //    auto algebraicToSquare = [](const std::string& s) -> int {
-                        //        if (s.size() != 2) return -1;
-                        //        char fileCh = static_cast<char>(std::tolower(static_cast<unsigned char>(s[0])));
-                        //        char rankCh = s[1];
-                        //        if (fileCh < 'a' || fileCh > 'h' || rankCh < '1' || rankCh > '8') return -1;
-                        //        int file = fileCh - 'a';
-                        //        int rank = rankCh - '1';
-                        //        return rank * 8 + file;
-                        //        };
-                        //    int toSq = algebraicToSquare(aiMove.substr(2, 2));
-                        //    selectedPiece->setSquare(toSq);
-                        //}
-                        //selectedPiece->setSquare(targetSquare);
+                        // Apply the move to the piece (this was commented out, causing snap-back)
+                        selectedPiece->setSquare(targetSquare);
+
                         // Mark piece as having moved (affects future castling rights)
                         selectedPiece->setHasMoved(true);
 
@@ -1300,7 +1385,6 @@ int main()
                         if (selectedPiece->getType() == PieceType::Pawn && std::abs(targetSquare - fromSq) == 16) {
                             ChessPiece::enPassantTargetSquare = (fromSq + targetSquare) / 2;
                         }
-                        //ChessPiece::whiteTurn = true;
                         ChessPiece::whiteTurn = !ChessPiece::whiteTurn;
 
 
@@ -1331,7 +1415,6 @@ int main()
                             }
                         }
                         else {
-                            // We applied an incoming network command locally — don't echo it back.
                             commandMove = false; // clear the pending command so it won't be processed again
                         }
 
@@ -1443,7 +1526,7 @@ int main()
                         && up->isWhite() == ChessPiece::whiteTurn
                         && up->getSquare() != endangeredKingSquare
                         && allowedPieces.find(up->getSquare()) != allowedPieces.end()) {
-                        up->drawPieceWithGlow(window, up->getSprite(), sf::Color(70, 140, 245, 120), 12, 0.60f);
+                        up->drawPieceWithGlow(window, up->getSprite(), sf::Color(70, 140, 245, 130), 12, 0.60f);
                     }
                 }
 
@@ -1471,7 +1554,7 @@ int main()
                     }
                 }
 
-				if (aifirstmove) aifirstmove = false;
+                if (aifirstmove) aifirstmove = false;
 
                 window.display();
 
@@ -1604,6 +1687,7 @@ int main()
                 //                    }
                 //                }
                 //            }
+            sf::sleep(sf::milliseconds(1));
         }
     }
     }
