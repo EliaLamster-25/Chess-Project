@@ -2,14 +2,22 @@
 #include "assets/chessPieces/blackBishop.h"
 #include "Bishop.hpp"
 #include "stockfish.hpp"
+#include <limits>
 
-enum class State { Menu, Game_Singleplayer, Game_Multiplayer, Game_BotMatch };
+// ADDED: overlay buffer helpers
+#include <string>
+
+enum class State { Menu, Game_Singleplayer, Game_Multiplayer, Game_BotMatch, Game_Bot_vs_Bot};
 
 bool aifirstmove;
 
+bool gameOver = false;
+
 ChessPiece* selectedPiece = nullptr;
 
-constexpr int kEngineMoveTimeMs = 150; // tweak between 50..200 for responsiveness
+constexpr int kEngineMoveTimeMs = 50; // tweak between 50..200 for responsiveness
+
+constexpr float kSlideAnimSeconds = 0.20f;
 
 //json json_game;
 
@@ -17,6 +25,9 @@ State currentState;
 namespace {
     std::vector<std::unique_ptr<ChessPiece>> pieces;
 }
+
+static json lastEngineStats;
+static json compareLastEngineStats;
 
 std::vector<std::unique_ptr<ChessPiece>>& getPieces()
 {
@@ -28,6 +39,35 @@ const std::vector<std::unique_ptr<ChessPiece>>& getPiecesConst()
     return pieces;
 }
 
+// Put near other helpers
+static int mouseToLogicalSquare(const sf::Vector2f& mouseF,
+    const sf::Vector2u& boardSize,
+    int offsetX,
+    bool flipPerspective)
+{
+    constexpr int kLabelPad = 28;
+    const int rectH = static_cast<int>((static_cast<int>(boardSize.y) - 2 * kLabelPad) / 8);
+    const int rectW = rectH;
+    const float left = static_cast<float>(offsetX + kLabelPad);
+    const float top = static_cast<float>(kLabelPad);
+    const float right = left + 8.f * static_cast<float>(rectW);
+    const float bottom = top + 8.f * static_cast<float>(rectH);
+    if (mouseF.x < left || mouseF.x > right || mouseF.y < top || mouseF.y > bottom)
+        return -1;
+    const int fileFromLeft = std::clamp(static_cast<int>((mouseF.x - left) / rectW), 0, 7);
+    const int rankFromTop = std::clamp(static_cast<int>((mouseF.y - top) / rectH), 0, 7);
+    const int logicalFile = flipPerspective ? (7 - fileFromLeft) : fileFromLeft;
+    const int logicalRank = flipPerspective ? rankFromTop : (7 - rankFromTop);
+    return logicalRank * 8 + logicalFile;
+}
+
+// Put near other statics/top-level helpers
+static bool anyPieceSliding() {
+    for (auto& up : pieces) {
+        if (up && up->isSliding()) return true;
+    }
+    return false;
+}
 
 static std::optional<PieceType> pieceTypeFromString(std::string_view s) {
     std::string t(s);
@@ -78,6 +118,13 @@ static void flipBoardStateHoriz(std::vector<int>& board) {
         flipped[fsq] = board[sq];
     }
     board.swap(flipped);
+}
+
+static inline int flipSquareVert(int sq) {
+    if (sq < 0 || sq >= 64) return sq;
+    const int file = sq % 8;
+    const int rank = sq / 8;
+    return (7 - rank) * 8 + file;
 }
 
 // Flip all piece squares horizontally (off-board pieces stay off).
@@ -208,106 +255,6 @@ static bool parseUciMove(const std::string& uci, int& fromSq, int& toSq, char& p
     return fromSq >= 0 && toSq >= 0;
 }
 
-// FEN builder (simplified half/full-move counters)
-static std::string makeFEN(const std::vector<std::unique_ptr<ChessPiece>>& pieces) {
-    // Fill piece table
-    char board[64] = {};
-    auto pieceChar = [](const ChessPiece& p) -> char {
-        char c = '?';
-        switch (p.getType()) {
-        case PieceType::Pawn:   c = 'p'; break;
-        case PieceType::Knight: c = 'n'; break;
-        case PieceType::Bishop: c = 'b'; break;
-        case PieceType::Rook:   c = 'r'; break;
-        case PieceType::Queen:  c = 'q'; break;
-        case PieceType::King:   c = 'k'; break;
-        }
-        return p.isWhite() ? static_cast<char>(std::toupper(static_cast<unsigned char>(c))) : c;
-        };
-
-    for (auto& up : pieces) {
-        int s = up->getSquare();
-        if (s >= 0 && s < 64) board[s] = pieceChar(*up);
-    }
-
-    // Piece placement (rank 8 to 1)
-    std::ostringstream fen;
-    for (int rank = 7; rank >= 0; --rank) {
-        int empty = 0;
-        for (int file = 0; file < 8; ++file) {
-            int idx = rank * 8 + file;
-            if (board[idx] == 0) {
-                ++empty;
-            }
-            else {
-                if (empty > 0) { fen << empty; empty = 0; }
-                fen << board[idx];
-            }
-        }
-        if (empty > 0) fen << empty;
-        if (rank != 0) fen << '/';
-    }
-
-    // Side to move
-    fen << ' ' << (ChessPiece::whiteTurn ? 'w' : 'b') << ' ';
-
-    // Castling rights
-    bool wK = false, wQ = false, bK = false, bQ = false;
-    // Find kings and corner rooks that have not moved
-    ChessPiece* wKing = nullptr; ChessPiece* bKing = nullptr;
-    ChessPiece* wRookA1 = nullptr; ChessPiece* wRookH1 = nullptr;
-    ChessPiece* bRookA8 = nullptr; ChessPiece* bRookH8 = nullptr;
-
-    for (auto& up : pieces) {
-        int s = up->getSquare();
-        if (s < 0 || s > 63) continue;
-        if (up->getType() == PieceType::King) {
-            if (up->isWhite()) wKing = up.get(); else bKing = up.get();
-        }
-        else if (up->getType() == PieceType::Rook) {
-            if (up->isWhite()) {
-                if (s == toSquare(0, 0)) wRookA1 = up.get();
-                if (s == toSquare(7, 0)) wRookH1 = up.get();
-            }
-            else {
-                if (s == toSquare(0, 7)) bRookA8 = up.get();
-                if (s == toSquare(7, 7)) bRookH8 = up.get();
-            }
-        }
-    }
-    if (wKing && !wKing->getHasMoved()) {
-        if (wRookH1 && !wRookH1->getHasMoved()) wK = true;
-        if (wRookA1 && !wRookA1->getHasMoved()) wQ = true;
-    }
-    if (bKing && !bKing->getHasMoved()) {
-        if (bRookH8 && !bRookH8->getHasMoved()) bK = true;
-        if (bRookA8 && !bRookA8->getHasMoved()) bQ = true;
-    }
-    std::string rights;
-    if (wK) rights.push_back('K');
-    if (wQ) rights.push_back('Q');
-    if (bK) rights.push_back('k');
-    if (bQ) rights.push_back('q');
-    fen << (rights.empty() ? "-" : rights) << ' ';
-
-    // En passant target
-    if (ChessPiece::enPassantTargetSquare >= 0 && ChessPiece::enPassantTargetSquare < 64) {
-        fen << squareToAlgebraic(ChessPiece::enPassantTargetSquare);
-    }
-    else {
-        fen << '-';
-    }
-
-    // Halfmove clock and fullmove number (not tracked; safe defaults)
-    fen << " 0 1";
-    return fen.str();
-}
-
-// Add this function definition before main() or in a suitable header/source file.
-// This is a placeholder implementation that picks a random legal move for black.
-// Replace the logic inside with your actual bot's AI (e.g., minimax, alpha-beta pruning, etc.).
-// It iterates over all black pieces, collects all legal moves (filtering self-check), and picks one randomly.
-
 #include <random>  // For std::random_device, std::mt19937, std::uniform_int_distribution
 
 std::string getBotUciMove(const std::vector<std::unique_ptr<ChessPiece>>& pieces) {
@@ -415,56 +362,6 @@ void setState(State state) {
     currentState = state;
 }
 
-void input(std::vector<ChessPiece*> piecePtrs) {
-    std::string line;
-    std::cout << "Enter move (e.g., e2 e4 or 12 28): ";
-    std::getline(std::cin, line);
-
-    std::istringstream iss(line);
-    std::string startToken, endToken;
-    received_startSquare = -1;
-    received_endSquare = -1;
-
-    iss >> startToken >> endToken;
-
-    auto parseSquare = [](const std::string& tok) -> int {
-        if (tok.empty()) return -1;
-        // Try integer first
-        bool allDigits = !tok.empty() && std::all_of(tok.begin(), tok.end(), ::isdigit);
-        if (allDigits) {
-            int v = std::stoi(tok);
-            return (v >= 0 && v < 64) ? v : -1;
-        }
-        // Try algebraic (e.g., e2)
-        if (tok.size() == 2) {
-            char fileCh = static_cast<char>(std::tolower(tok[0]));
-            char rankCh = tok[1];
-            if (fileCh >= 'a' && fileCh <= 'h' && rankCh >= '1' && rankCh <= '8') {
-                int file = fileCh - 'a';
-                int rank = (rankCh - '1'); // rank 0..7 from white's perspective
-                return rank * 8 + file;
-            }
-        }
-        return -1;
-        };
-
-    if (!startToken.empty()) received_startSquare = parseSquare(startToken);
-    if (!endToken.empty())   received_endSquare = parseSquare(endToken);
-
-    // Only arm the command when squares are valid
-    if (received_startSquare >= 0 && received_startSquare < 64 &&
-        received_endSquare >= 0 && received_endSquare < 64) {
-        commandMove = true;
-        json data;
-        //data["start_square"] = received_startSquare;
-        //data["end_square"] = received_endSquare;
-     //   std::cout << "JSON: " << data["start_square"] << "\n";
-    }
-    else {
-        std::cout << "Invalid squares. Use 0..63 or algebraic (e.g., e2 e4).\n";
-    }
-}
-
 static bool applyUciMoveLocal(const std::string& uci, std::vector<std::unique_ptr<ChessPiece>>& pieces) {
     int fromSq = -1, toSq = -1; char promo = 0;
     if (!parseUciMove(uci, fromSq, toSq, promo)) return false;
@@ -494,6 +391,8 @@ static bool applyUciMoveLocal(const std::string& uci, std::vector<std::unique_pt
             if (up->getSquare() == rookFrom &&
                 up->isWhite() == mover->isWhite() &&
                 up->getType() == PieceType::Rook) {
+                // animate rook as part of castling
+                up->beginSlide(rookFrom, rookTo, kSlideAnimSeconds);
                 up->setSquare(rookTo);
                 up->setHasMoved(true);
                 break;
@@ -526,7 +425,8 @@ static bool applyUciMoveLocal(const std::string& uci, std::vector<std::unique_pt
     }
     if (targetEnemy) targetEnemy->setSquare(-1);
 
-    // Move the piece
+    // Move the piece with animation
+    mover->beginSlide(fromSq, toSq, kSlideAnimSeconds);
     mover->setSquare(toSq);
     mover->setHasMoved(true);
 
@@ -536,20 +436,27 @@ static bool applyUciMoveLocal(const std::string& uci, std::vector<std::unique_pt
         ChessPiece::enPassantTargetSquare = (fromSq + toSq) / 2;
     }
 
-
     ChessPiece::whiteTurn = !ChessPiece::whiteTurn;
     return true;
 }
 
-std::atomic<bool> running{ true };
+botOverlay engineStats;
 
-void inputLoop(std::vector<ChessPiece*>& piecePtrs) {
-    while (running) {
-        input(piecePtrs);
+bool handleEngineStats(sf::RenderWindow& window, sf::Vector2u size, json data, networkManager& net) {
+    (void)net;
+    if (currentState == State::Game_BotMatch || currentState == State::Game_Bot_vs_Bot) {
+        if (data.is_object()) {
+			lastEngineStats = data;
+   //         std::cout << "[Engine Stats] " << data.dump() << "\n";
+			//std::cout << "[Last Engine Stats] " << lastEngineStats.dump() << "\n";
+            return true;
+        }
     }
+    return false;
 }
 
-// Defer engine reply by one frame so we render between moves
+std::atomic<bool> running{ true };
+
 enum class ReplyRoute { None, ToClient, ToHost };
 static ReplyRoute engineReplyRoute = ReplyRoute::None;
 static bool engineReplyScheduled = false;
@@ -560,6 +467,7 @@ int main()
 {
     setState(State::Menu);
     sf::VideoMode desktopMode = sf::VideoMode::getDesktopMode();
+    sf::Vector2f windowSize(static_cast<float>(desktopMode.size.x), static_cast<float>(desktopMode.size.y));
     sf::ContextSettings contextSettings;
     contextSettings.antiAliasingLevel = 8;
     contextSettings.depthBits = 24;
@@ -578,12 +486,7 @@ int main()
 
     StockfishEngine engine(L"C:/Users/elamster/Downloads/stockfish-windows-x86-64-avx2/stockfish/stockfish.exe");  // Note the L prefix for wide string literal
     aifirstmove = true;
-    if (!engine.initialize()) {
-        // Handle error
-        return 1;
-    }
 
-    // Ensure a fresh game state
     ChessPiece::whiteTurn = true;
     ChessPiece::enPassantTargetSquare = -1;
 
@@ -594,13 +497,22 @@ int main()
     std::vector<int> moves;
     std::vector<int> captureMoves;
 
-    bool gameOver = false;
+    bool gameOver = true;
+
+    static sf::Font font;
+    static bool fontReady = false;
+
+    if (!fontReady) {
+        if (!font.openFromMemory(segoeuithibd_ttf, segoeuithibd_ttf_len)) {
+            std::cerr << "Failed to load Segoe UI font from memory\n";
+            fontReady = false;
+        }
+        else {
+            fontReady = true;
+        }
+    }
 
     networkManager networkManager;
-
-    std::thread consoleThread([&]() {
-        inputLoop(piecePtrs);
-        });
 
     std::thread networkThread;          // default-constructed, not joinable yet
     bool networkThreadStarted = false;
@@ -649,18 +561,40 @@ int main()
                         isNetworkHost = true;
                         continue;
                     }
+                    if (action == "botVsBot") {
+                        setState(State::Game_Bot_vs_Bot);
+
+                        // Start network thread only once
+                        if (!networkThreadStarted) {
+                            networkThreadStarted = true;
+                            networkThread = std::thread([&]() {
+                                networkManager.start("botMatch");
+                                });
+                        }
+                        isNetworkHost = true;
+                        engine.initialize();
+                        continue;
+                    }
                 }
 
                 window.clear();
-                chess.draw(window, boardSize);
+                chess.draw(window, boardSize, false);
                 menu.draw(window);
                 window.display();
                 sf::sleep(sf::milliseconds(1));
                 continue;
             }
-            else if (currentState == State::Game_Singleplayer || currentState == State::Game_Multiplayer || currentState == State::Game_BotMatch) {
+            // Include Game_Bot_vs_Bot here so the game loop runs after the menu closes.
+            else if (currentState == State::Game_Singleplayer
+                  || currentState == State::Game_Multiplayer
+                  || currentState == State::Game_BotMatch
+                  || currentState == State::Game_Bot_vs_Bot) {
                 window.clear();
-                if (currentState == State::Game_BotMatch && engineReplyScheduled && !gameOver) {
+                // Put this right before the first draw call in the render branch (before: chess.draw(window, boardSize);)
+                const bool flipPerspective = (currentState == State::Game_Multiplayer) && !isNetworkHost;
+                // Defer engine reply by one frame so we render between moves
+
+                if (currentState == State::Game_Bot_vs_Bot && engineReplyScheduled && !gameOver && !anyPieceSliding()) {
                     std::string reply = engine.getNextMove(kEngineMoveTimeMs);
                     std::cout << "Stockfish reply (deferred): " << reply << "\n";
                     if (!reply.empty() && reply != "(none)") {
@@ -680,40 +614,32 @@ int main()
                     engineReplyScheduled = false;
                     engineReplyRoute = ReplyRoute::None;
                 }
-                else if (currentState == State::Game_Multiplayer || currentState == State::Game_BotMatch) {
+                else if (currentState == State::Game_Multiplayer || currentState == State::Game_BotMatch || currentState == State::Game_Bot_vs_Bot) {
                     if (aifirstmove) {
-                        // Only do this for BotMatch client or Multiplayer host; here we care about BotMatch client
+                        // Only do this for BotVsBot client or Multiplayer host; here we care about BotVsBot client
                         if (!ChessPiece::whiteTurn) ChessPiece::whiteTurn = true;
 
-                        if (currentState == State::Game_BotMatch) {
-                            // Start fresh for each new BotMatch
+                        if (currentState == State::Game_Bot_vs_Bot) {
+                            // Start fresh for each new BotVsBot
                             engine.reset();
-                        }
 
-                        std::string aiMove = engine.getNextMove(kEngineMoveTimeMs);
-                        std::cout << "Stockfish suggests move: " << aiMove << "\n";
 
-                        bool applied = false;
-                        if (!aiMove.empty() && aiMove != "(none)") {
-                            applied = applyUciMoveLocal(aiMove, pieces);
-                        }
+                            std::string aiMove = engine.getNextMove(kEngineMoveTimeMs);
+                            std::cout << "Stockfish suggests move: " << aiMove << "\n";
 
-                        if (applied) {
-                            // In BotMatch, send to the server (host)
-                            if (currentState == State::Game_BotMatch) {
-                                networkManager.sendToHost(aiMove);
+                            bool applied = false;
+                            if (!aiMove.empty() && aiMove != "(none)") {
+                                applied = applyUciMoveLocal(aiMove, pieces);
                             }
-                            else if (isNetworkHost) {
-                                networkManager.sendToClient(aiMove);
+
+                            if (applied) {
+                                networkManager.sendToHost(aiMove);
+                                selectedPiece = nullptr;
+                                aifirstmove = false;
                             }
                             else {
-                                networkManager.sendToHost(aiMove);
+                                std::cerr << "[AI] Failed to apply opening move: " << aiMove << "\n";
                             }
-                            selectedPiece = nullptr;
-                            aifirstmove = false;
-                        }
-                        else {
-                            std::cerr << "[AI] Failed to apply opening move: " << aiMove << "\n";
                         }
                     }
                     json received_data;
@@ -722,92 +648,104 @@ int main()
                     {
                         auto status = networkManager.receiveFromClient(received_data);
                         if (status == 1) {
-                            if (currentState == State::Game_BotMatch && received_data.is_string()) {
+                            // Primary path: always expect a UCI string (e.g., "e2e4" or "e7e8q")
+                            if (received_data.is_string()) {
                                 const std::string uci = received_data.get<std::string>();
 
-                                // Apply client's move immediately
                                 if (!applyUciMoveLocal(uci, pieces)) {
                                     std::cerr << "Failed to apply client move: \"" << uci << "\"\n";
+                                } else {
+                                    if (currentState == State::Game_Bot_vs_Bot) {
+                                        engine.opponentMove(uci);
+                                        engineReplyScheduled = true;
+                                        engineReplyRoute = ReplyRoute::ToClient;
+                                    }
                                 }
-                                else {
-                                    // Tell engine the opponent just moved, then get and apply reply
-                                    // Tell engine the opponent just moved; schedule reply next frame
-                                    engine.opponentMove(uci);
-                                    engineReplyScheduled = true;
-                                    engineReplyRoute = ReplyRoute::ToClient;
-                                }
-
-                                // Clear any stale selection
                                 selectedPiece = nullptr;
                             }
-                            else if (received_data.contains("start_square") && received_data["start_square"].is_number_integer() &&
-                                received_data.contains("end_square") && received_data["end_square"].is_number_integer()) {
-                                const int fs = received_data["start_square"].get<int>();
-                                const int ts = received_data["end_square"].get<int>();
-                                const std::string uci = squareToString(fs) + squareToString(ts);
-                                if (!applyUciMoveLocal(uci, pieces)) {
-                                    std::cerr << "Failed to apply client move: " << uci << "\n";
+                            // Back-compat: only attempt if payload is an object
+                            else if (received_data.is_object()) {
+                                const auto itStart = received_data.find("start_square");
+                                const auto itEnd   = received_data.find("end_square");
+                                if (itStart != received_data.end() && itEnd != received_data.end()
+                                    && itStart->is_number_integer() && itEnd->is_number_integer()) {
+                                    const int fs = itStart->get<int>();
+                                    const int ts = itEnd->get<int>();
+                                    const std::string uci = squareToString(fs) + squareToString(ts);
+
+                                    if (!applyUciMoveLocal(uci, pieces)) {
+                                        std::cerr << "Failed to apply client move (legacy JSON): " << uci << "\n";
+                                    } else if (currentState == State::Game_Bot_vs_Bot) {
+                                        engine.opponentMove(uci);
+                                        if (!gameOver) {
+                                            engineReplyScheduled = true;
+                                            engineReplyRoute = ReplyRoute::ToClient;
+                                        }
+                                    }
+                                    selectedPiece = nullptr;
+                                } else {
+                                    std::cerr << "Malformed legacy move packet from client: " << received_data.dump() << "\n";
                                 }
-                                selectedPiece = nullptr;
                             }
                             else {
-                                std::cerr << "Malformed move packet: " << received_data.dump() << "\n";
+                                std::cerr << "Malformed move packet from client (type=" << received_data.type_name() << "): " << received_data.dump() << "\n";
                             }
                         }
                     }
-                    // Client path: handle BotMatch string payloads safely, otherwise expect an object
+                    // Client path
                     else
                     {
                         auto status = networkManager.receiveFromHost(received_data);
+
                         if (status == 1) {
-                            if (currentState == State::Game_BotMatch && received_data.is_string()) {
-                                const std::string uci = received_data.get<std::string>();
-                                std::cout << "[server->client] Black UCI: " << uci << "\n";
+                            if (!handleEngineStats(window, boardSize, received_data, networkManager)) {
+                                if (received_data.is_string()) {
+                                    const std::string uci = received_data.get<std::string>();
+                                    std::cout << "[server->client] UCI: " << uci << "\n";
 
-                                // Apply black move locally
-                                if (!applyUciMoveLocal(uci, pieces)) {
-                                    std::cerr << "Failed to apply host move: \"" << uci << "\"\n";
-                                }
-                                else {
-                                    // Tell local engine what black just played
-                                    // Tell local engine what black just played; schedule white reply next frame
-                                    engine.opponentMove(uci);
-                                    if (!gameOver) {
-                                        engineReplyScheduled = true;
-                                        engineReplyRoute = ReplyRoute::ToHost;
+                                    if (!applyUciMoveLocal(uci, pieces)) {
+                                        std::cerr << "Failed to apply host move: \"" << uci << "\"\n";
                                     }
-                                }
-                                selectedPiece = nullptr;
-                            }
-                            else if (received_data.contains("start_square") && received_data["start_square"].is_number_integer() &&
-                                received_data.contains("end_square") && received_data["end_square"].is_number_integer()) {
-                                const int fs = received_data["start_square"].get<int>();
-                                const int ts = received_data["end_square"].get<int>();
-                                const std::string uci = squareToString(fs) + squareToString(ts);
-
-                                if (!applyUciMoveLocal(uci, pieces)) {
-                                    std::cerr << "Failed to apply host move: " << uci << "\n";
-                                }
-                                else {
-                                    engine.opponentMove(uci);
-
-                                    if (!gameOver) {
-                                        std::string reply = engine.getNextMove(kEngineMoveTimeMs);
-                                        std::cout << "[client/Stockfish] White UCI: " << reply << "\n";
-                                        if (!reply.empty() && reply != "(none)") {
-                                            if (applyUciMoveLocal(reply, pieces)) {
-                                                networkManager.sendToHost(reply);
-                                            }
-                                            else {
-                                                std::cerr << "[AI] Failed to apply white reply: " << reply << "\n";
+                                    else {
+                                        if (currentState == State::Game_Bot_vs_Bot) {
+                                            engine.opponentMove(uci);
+                                            if (!gameOver) {
+                                                engineReplyScheduled = true;
+                                                engineReplyRoute = ReplyRoute::ToHost;
                                             }
                                         }
                                     }
+                                    selectedPiece = nullptr;
                                 }
-                                selectedPiece = nullptr;
-                            }
-                            else {
-                                std::cerr << "Malformed move packet: " << received_data.dump() << "\n";
+                                // Back-compat: only attempt if payload is an object
+                                else if (received_data.is_object()) {
+                                    const auto itStart = received_data.find("start_square");
+                                    const auto itEnd = received_data.find("end_square");
+                                    if (itStart != received_data.end() && itEnd != received_data.end()
+                                        && itStart->is_number_integer() && itEnd->is_number_integer()) {
+                                        const int fs = itStart->get<int>();
+                                        const int ts = itEnd->get<int>();
+                                        const std::string uci = squareToString(fs) + squareToString(ts);
+
+                                        if (!applyUciMoveLocal(uci, pieces)) {
+                                            std::cerr << "Failed to apply host move (legacy JSON): " << uci << "\n";
+                                        }
+                                        else if (currentState == State::Game_Bot_vs_Bot) {
+                                            engine.opponentMove(uci);
+                                            if (!gameOver) {
+                                                engineReplyScheduled = true;
+                                                engineReplyRoute = ReplyRoute::ToHost;
+                                            }
+                                        }
+                                        selectedPiece = nullptr;
+                                    }
+                                    else {
+                                        std::cerr << "Malformed legacy move packet from host: " << received_data.dump() << "\n";
+                                    }
+                                }
+                                else {
+                                    std::cerr << "Malformed move packet from host (type=" << received_data.type_name() << "): " << received_data.dump() << "\n";
+                                }
                             }
                         }
                     }
@@ -946,11 +884,9 @@ int main()
                                 if (up->isWhite() == ChessPiece::whiteTurn
                                     && up->containsPoint(mouseF)
                                     && ((currentState == State::Game_Singleplayer)
-                                        ? true // in singleplayer, let the user move the side to move
+                                        ? true
                                         : (up->isWhite() == isLocalSideWhite))) {
 
-
-                                    // if in check, only allow selecting pieces that can help
                                     if (!allowedPieces.empty() && allowedPieces.count(up->getSquare()) == 0) {
                                         continue;
                                     }
@@ -958,7 +894,17 @@ int main()
                                     selectedPiece = up.get();
                                     dragOffset = mouseF - selectedPiece->getSprite().getPosition();
 
-                                    // choose moves: either restricted escapeMoves or normal moves
+                                    // Compute base scale and animate shrink to 88% for click feedback
+                                    constexpr int kLabelPad = 28;
+                                    const float rectW = static_cast<float>((boardSize.y - 2 * kLabelPad) / 8);
+                                    float baseScale = (rectW * 0.6f) / 100.f;
+                                    if (selectedPiece->getType() == PieceType::Queen || selectedPiece->getType() == PieceType::King) {
+                                        baseScale = (rectW * 0.7f) / 100.f;
+                                    }
+                                    const float targetShrink = baseScale * 0.88f; // 12% smaller
+                                    selectedPiece->startScaleAnimation(selectedPiece->currentScale, targetShrink, 0.05f);
+
+                                    // choose moves (existing logic) ...
                                     if (!escapeMoves.empty()) {
                                         moves.clear();
                                         for (auto& em : escapeMoves) {
@@ -1145,26 +1091,32 @@ int main()
                             : sf::Vector2f();
 
                         // New board geometry based on your square placement
-                        float rectW = static_cast<float>(boardSize.y) / 8.f;
-                        float rectH = rectW;
-                        float stepX = rectW * 0.95f;
-                        float stepY = rectH * 0.95f;
-                        float left = offsetX * 1.06f;
-                        float top = rectH * 0.20f; // 0.2*RectHeight top margin
-                        float right = left + 8.f * stepX;
-                        float bottom = top + 8.f * stepY;
+                        //float rectW = static_cast<float>(boardSize.y) / 8.f;
+                        //float rectH = rectW;
+                        //float stepX = rectW * 0.95f;
+                        //float stepY = rectH * 0.95f;
+                        //float left = offsetX * 1.06f;
+                        //float top = rectH * 0.20f; // 0.2*RectHeight top margin
+                        //float right = left + 8.f * stepX;
+                        //float bottom = top + 8.f * stepY;
 
                         // Helper: snap sprite back to its current square center using new formula
                         auto snapBack = [&]() {
-                            int fileOld = toFile(selectedPiece->getSquare());
-                            int rankOld = toRank(selectedPiece->getSquare());
-                            float squareX = rectW * fileOld * 0.95f + offsetX * 1.06f;
-                            float squareY = rectH * (7 - rankOld * 0.95f) - rectH * 0.15f;
-                            float cx = squareX + (rectW * 0.95f) / 2.f;
-                            float cy = squareY + (rectH * 0.95f) / 2.f;
+                            const int logicalSq = selectedPiece->getSquare();
+                            const int dispSq = flipPerspective ? (63 - logicalSq) : logicalSq;
+                            const int df = dispSq % 8;
+                            const int dr = dispSq / 8;
+                            constexpr int kLabelPad = 28;
+                            const float rectW = static_cast<float>((boardSize.y - 2 * kLabelPad) / 8);
+                            const float rectH = rectW;
+                            const float left = static_cast<float>(offsetX + kLabelPad);
+                            const float top = static_cast<float>(kLabelPad);
+                            const float squareX = left + rectW * df;
+                            const float squareY = top + rectH * (7 - dr);
+                            const float cx = squareX + rectW / 2.f;
+                            const float cy = squareY + rectH / 2.f;
                             selectedPiece->getSprite().setPosition(sf::Vector2f(cx, cy));
                             };
-
 
                         // Compute legal moves (restricted if in check)
                         auto legalMoves = selectedPiece->getPossibleMoves(boardState);
@@ -1180,56 +1132,48 @@ int main()
 
                         // Determine target square
                         int targetSquare = -1;
-                        bool flipPerspective = (currentState == State::Game_Multiplayer) && !isNetworkHost;
                         if (usingCommand) {
                             targetSquare = received_endSquare;
                         }
                         else {
-                            // If released outside the visual board, snap back immediately
-                            if (mouseF.x < left || mouseF.x > right || mouseF.y < top || mouseF.y > bottom) {
+                            targetSquare = mouseToLogicalSquare(mouseF, boardSize, offsetX, flipPerspective);
+                            if (targetSquare == -1) {
                                 snapBack();
                                 selectedPiece = nullptr;
                                 moves.clear();
                                 captureMoves.clear();
                                 continue;
                             }
-
-                            // Derive "display square" (the square as laid out visually in white's orientation)
-                            int fileFromLeft = std::clamp(static_cast<int>((mouseF.x - left) / stepX), 0, 7);
-                            int rankFromTop = std::clamp(static_cast<int>((mouseF.y - top) / stepY), 0, 7);
-
-                            int displayFile = fileFromLeft;
-                            int displayRank = 7 - rankFromTop;            // existing white-oriented conversion
-                            int displaySquare = toSquare(displayFile, displayRank);
-
-                            // Map display square back to logical square if perspective is flipped
-                            // (We drew black pieces on square (63 - logical), so invert that mapping here)
-                            targetSquare = flipPerspective ? (63 - displaySquare) : displaySquare;
                         }
 
                         // If move not legal, exit appropriately
                         if (std::find(legalMoves.begin(), legalMoves.end(), targetSquare) == legalMoves.end()) {
                             if (!usingCommand) {
-                                float rectW = static_cast<float>(boardSize.y) / 8.f;
-                                float rectH = rectW;
-                                bool flip = flipPerspective;
-                                int logicalSq = selectedPiece->getSquare();
-                                int dispSq = flip ? (63 - logicalSq) : logicalSq;
-                                int df = toFile(dispSq);
-                                int dr = toRank(dispSq);
-                                float squareX = rectW * df * 0.95f + offsetX * 1.06f;
-                                float squareY = rectH * (7 - dr * 0.95f) - rectH * 0.15f;
-                                float x = squareX + (rectW * 0.95f) / 2.f;
-                                float y = squareY + (rectH * 0.95f) / 2.f;
+                                const int logicalSq = selectedPiece->getSquare();
+                                const int dispSq = flipPerspective ? (63 - logicalSq) : logicalSq;
+                                const int df = dispSq % 8;
+                                const int dr = dispSq / 8;
+                                constexpr int kLabelPad = 28;
+                                const float rectW = static_cast<float>((boardSize.y - 2 * kLabelPad) / 8);
+                                const float rectH = rectW;
+                                const float left = static_cast<float>(offsetX + kLabelPad);
+                                const float top = static_cast<float>(kLabelPad);
+                                const float squareX = left + rectW * df;
+                                const float squareY = top + rectH * (7 - dr);
+                                const float x = squareX + rectW / 2.f;
+                                const float y = squareY + rectH / 2.f;
                                 selectedPiece->getSprite().setPosition(sf::Vector2f(x, y));
+
+                                // Animate scale back to base on release
+                                float baseScale = (rectW * 0.6f) / 100.f;
+                                if (selectedPiece->getType() == PieceType::Queen || selectedPiece->getType() == PieceType::King) {
+                                    baseScale = (rectW * 0.7f) / 100.f;
+                                }
+                                selectedPiece->startScaleAnimation(selectedPiece->currentScale, baseScale, 0.08f);
                             }
-                            std::cerr << "[apply] incoming move NOT legal: from=" << sent_startSquare << " to=" << targetSquare << "\n";
+                            std::cerr << "[apply] incoming move NOT legal: from=" << squareToString(sent_startSquare) << " to=" << squareToString(targetSquare) << "\n";
                             std::cerr << " legalMoves: ";
-                            for (int m : legalMoves) std::cerr << m << " ";
-                            std::cerr << "\n boardState nonzero squares: ";
-                            for (int i = 0; i < 64; i++) if (boardState[i] != 0) std::cerr << "(" << i << ":" << boardState[i] << ") ";
-                            std::cerr << "\n";
-                            // Cleanup
+                            for (int m : legalMoves) std::cerr << squareToString(m) << " ";
                             selectedPiece = nullptr;
                             moves.clear();
                             captureMoves.clear();
@@ -1374,6 +1318,7 @@ int main()
                         }
 
                         // Apply the move to the piece (this was commented out, causing snap-back)
+                        selectedPiece->beginSlide(fromSq, targetSquare, kSlideAnimSeconds);
                         selectedPiece->setSquare(targetSquare);
 
                         // Mark piece as having moved (affects future castling rights)
@@ -1394,27 +1339,14 @@ int main()
                         bool wasNetworkCommand = usingCommand; // usingCommand is true when this move came from received data
 
                         if (!wasNetworkCommand) {
-                            json sent_data;
+                            const std::string uciSent = squareToString(sent_startSquare) + squareToString(sent_endSquare);
+                            json sent_data = uciSent; // send as a plain string
                             if (isNetworkHost) {
-                                // host -> send structured object to client
-                                sent_data["start_square"] = sent_startSquare;
-                                sent_data["end_square"] = sent_endSquare;
                                 networkManager.sendToClient(sent_data);
-                            }
-                            else if (currentState == State::Game_BotMatch) {
-                                // BotMatch client path: send plain UCI (no flipping)
-                                sent_data = squareToString(sent_startSquare) + squareToString(sent_endSquare);
-                                std::cout << "[client->host] UCI: " << sent_data << "\n";
+                            } else {
                                 networkManager.sendToHost(sent_data);
                             }
-                            else {
-                                // normal client -> host structured object
-                                sent_data["start_square"] = sent_startSquare;
-                                sent_data["end_square"] = sent_endSquare;
-                                networkManager.sendToHost(sent_data);
-                            }
-                        }
-                        else {
+                        } else {
                             commandMove = false; // clear the pending command so it won't be processed again
                         }
 
@@ -1482,51 +1414,140 @@ int main()
 
                 } // end event loop
 
-                chess.draw(window, boardSize);
+				bool botInfo = currentState == State::Game_BotMatch || currentState == State::Game_Bot_vs_Bot;
+                chess.draw(window, boardSize, botInfo);
 
                 // Draw legal move hints using ChessBoard::drawCircle
                 if (selectedPiece && !moves.empty()) {
-                    std::unordered_set<int> captureSet(captureMoves.begin(), captureMoves.end());
+                    // Build fast lookup for legal squares
+                    std::unordered_set<int> legalSet(moves.begin(), moves.end());
+
+                    // Collect every legal square that lies on the path to any capture
+                    std::unordered_set<int> redSquares;
+                    if (!captureMoves.empty()) {
+                        const int fromSq = selectedPiece->getSquare();
+                        for (int capSq : captureMoves) {
+                            // Ray/path from 'fromSq' to the capture square (includes intermediates and the capture square)
+                            auto path = getPath(fromSq, capSq);
+                            for (int sq : path) {
+                                if (legalSet.find(sq) != legalSet.end()) {
+                                    redSquares.insert(sq);
+                                }
+                            }
+                        }
+                    }
+
+                    // Draw non-path legal moves in blue
                     for (int mv : moves) {
-                        if (captureSet.find(mv) == captureSet.end()) {
+                        if (redSquares.find(mv) == redSquares.end()) {
                             chess.drawCircle(window, boardSize, 0.13f, offsetX, mv, sf::Color(70, 140, 245, 230));
                         }
                     }
-                    for (int mv : captureMoves) {
-                        chess.drawCircle(window, boardSize, 0.13f, offsetX, mv, sf::Color(70, 140, 245, 230));
+                    // Draw capture-path legal moves (including the capture squares) in red
+                    for (int sq : redSquares) {
+                        chess.drawCircle(window, boardSize, 0.13f, offsetX, sq, sf::Color(220, 0, 0, 230));
                     }
                 }
 
                 // Draw selected piece last at its current sprite position (during drag)
                 if (selectedPiece && selectedPiece->getSquare() >= 0 && selectedPiece->getSquare() < 64) {
-                    float rectW = static_cast<float>(boardSize.y) / 8.f;
-                    float pieceScale = (rectW * 0.6f) / 100.f;
-                    selectedPiece->getSprite().setScale(sf::Vector2f(pieceScale, pieceScale));
-                    window.draw(selectedPiece->getSprite());
+                    // If the selected piece is the endangered king, draw a red rect behind it (before drawing the sprite)
                     if (inCheck && selectedPiece->getSquare() == endangeredKingSquare) {
-                        // was 0.3f -> too small to see
-                        selectedPiece->drawPieceWithGlow(window, selectedPiece->getSprite(), sf::Color(220, 0, 0, 120), 12, 0.60f);
+                        chess.drawRect(window, boardSize, 0.95f, offsetX, endangeredKingSquare, sf::Color(220, 0, 0, 120));
                     }
+                    //constexpr int kLabelPad = 28;
+                    //const float rectW = static_cast<float>((boardSize.y - 2 * kLabelPad) / 8);
+                    //float pieceScale = (rectW * 0.55f) / 100.f;  // Normal "pop" size for all
+                    //if (selectedPiece->getType() == PieceType::Queen) {
+                    //    pieceScale = (rectW * 0.7f) / 100.f;  // Extra large pop for Q/K
+                    //}
+                    //if (selectedPiece->getType() == PieceType::King) {
+                    //    pieceScale = (rectW * 0.65f) / 100.f;  // Extra large pop for Q/K
+                    //}
+                    //if (selectedPiece->getType() == PieceType::Knight) {
+                    //    pieceScale = (rectW * 0.65f) / 100.f;  // Extra large pop for Q/K
+                    //}
+                    //selectedPiece->getSprite().setScale(sf::Vector2f(pieceScale, pieceScale));
+                    selectedPiece->tickScaleOnly();
+                    window.draw(selectedPiece->getSprite());
                 }
 
                 // Draw pieces on-board (non-selected first)
-                for (auto& up : pieces) {
-                    if (!up) continue;
-                    if (up->getSquare() < 0 || up->getSquare() >= 64) continue;
-                    if (selectedPiece && up.get() == selectedPiece) continue; // draw selected last at drag position
-
-                    // Draw normally
-                    up->draw(window, boardSize, offsetX);
-
-                    // If this piece is endangered (e.g., king in check), overlay red glow
-                    if (inCheck && up->getSquare() == endangeredKingSquare) {
-                        up->drawPieceWithGlow(window, up->getSprite(), sf::Color(220, 0, 0, 120), 12, 0.60f);
+                // Draw pieces on-board (non-selected first)
+                {
+                    // Draw endangered king square once (under pieces)
+                    if (inCheck && endangeredKingSquare >= 0) {
+                        chess.drawRect(window, boardSize, 0.95f, offsetX, endangeredKingSquare, sf::Color(220, 0, 0, 120));
                     }
-                    if (inCheck
-                        && up->isWhite() == ChessPiece::whiteTurn
-                        && up->getSquare() != endangeredKingSquare
-                        && allowedPieces.find(up->getSquare()) != allowedPieces.end()) {
-                        up->drawPieceWithGlow(window, up->getSprite(), sf::Color(70, 140, 245, 130), 12, 0.60f);
+
+                    struct SavedState {
+                        ChessPiece* p;
+                        int origSq;
+                        int slideFrom;
+                        int slideTo;
+                        bool sliding;
+                    };
+                    std::vector<SavedState> saved;
+                    saved.reserve(pieces.size());
+
+                    // Temporarily flip logical squares for rendering if we're a multiplayer client
+                    if (flipPerspective) {
+                        for (auto& up : pieces) {
+                            if (!up) continue;
+                            if (up->getSquare() < 0 || up->getSquare() >= 64) continue;
+                            if (selectedPiece && up.get() == selectedPiece) continue;
+                            SavedState st{
+                                up.get(),
+                                up->getSquare(),
+                                up->slideFromSquare,
+                                up->slideToSquare,
+                                up->isSliding()
+                            };
+                            saved.push_back(st);
+                            up->setSquare(63 - st.origSq);
+                            if (st.sliding) {
+                                up->slideFromSquare = (st.slideFrom >= 0 && st.slideFrom < 64) ? (63 - st.slideFrom) : st.slideFrom;
+                                up->slideToSquare = (st.slideTo >= 0 && st.slideTo < 64) ? (63 - st.slideTo) : st.slideTo;
+                            }
+                        }
+                    }
+
+                    for (auto& up : pieces) {
+                        if (!up) continue;
+                        if (up->getSquare() < 0 || up->getSquare() >= 64) continue;
+                        if (selectedPiece && up.get() == selectedPiece) continue; // draw selected last at drag position
+
+                        // Find original square for logic checks (needed because we may have flipped `square`)
+                        int origSq = up->getSquare();
+                        if (flipPerspective) {
+                            auto it = std::find_if(saved.begin(), saved.end(), [&](const SavedState& st) { return st.p == up.get(); });
+                            if (it != saved.end()) origSq = it->origSq;
+                        }
+
+                        // Draw piece (square may be flipped)
+                        up->draw(window, boardSize, offsetX);
+
+                        // Show blue glow only to the local player if their own king is in check (MP/BotMatch).
+                        const bool restrictGlowToLocal = (currentState == State::Game_Multiplayer || currentState == State::Game_BotMatch);
+                        const bool localSideIsInCheck = (isLocalSideWhite == ChessPiece::whiteTurn);
+                        const bool showForLocal = (!restrictGlowToLocal) || (localSideIsInCheck && up->isWhite() == isLocalSideWhite);
+
+                        if (inCheck
+                            && up->isWhite() == ChessPiece::whiteTurn
+                            && origSq != endangeredKingSquare
+                            && allowedPieces.find(origSq) != allowedPieces.end()
+                            && showForLocal) {
+                            up->drawPieceWithGlow(window, up->getSprite(), sf::Color(70, 140, 245, 130), 12, 0.60f);
+                        }
+                    }
+
+                    // Restore original logical squares after rendering
+                    if (flipPerspective) {
+                        for (const auto& st : saved) {
+                            st.p->setSquare(st.origSq);
+                            st.p->slideFromSquare = st.slideFrom;
+                            st.p->slideToSquare = st.slideTo;
+                        }
                     }
                 }
 
@@ -1556,139 +1577,41 @@ int main()
 
                 if (aifirstmove) aifirstmove = false;
 
+                engineStats.draw(window, boardSize, lastEngineStats);
+
+                if (gameOver) {
+					std::string winner = ChessPiece::whiteTurn ? "Black" : "White";
+                    // Show game over screen
+                    sf::RectangleShape overlay(sf::Vector2f(static_cast<float>(boardSize.x), static_cast<float>(boardSize.y)));
+                    overlay.setFillColor(sf::Color(0, 0, 0, 150));
+                    window.draw(overlay);
+
+                    sf::Text gameOverText(font, "Game Over");
+                    gameOverText.setCharacterSize(64);
+                    gameOverText.setFillColor(sf::Color::White);
+                    const sf::FloatRect gameOverTextBounds = gameOverText.getLocalBounds();
+                    gameOverText.setOrigin(sf::Vector2f(gameOverTextBounds.position.x + gameOverTextBounds.size.x / 2.f,
+                        gameOverTextBounds.position.y + gameOverTextBounds.size.y / 2.f));
+                    gameOverText.setPosition(sf::Vector2f(static_cast<float>(boardSize.x) / 2.f + 63,
+                        static_cast<float>(boardSize.y) / 2.f));
+
+                    sf::Text winnerText(font, winner + " won");
+                    winnerText.setCharacterSize(40);
+                    winnerText.setFillColor(sf::Color::White);
+                    const sf::FloatRect winnerTextBounds = winnerText.getLocalBounds();
+                    winnerText.setOrigin(sf::Vector2f(winnerTextBounds.position.x + winnerTextBounds.size.x / 2.f,
+                        winnerTextBounds.position.y + winnerTextBounds.size.y / 2.f));
+                    winnerText.setPosition(sf::Vector2f(static_cast<float>(boardSize.x) / 2.f + 63,
+                        static_cast<float>(boardSize.y) / 2.f - 63));
+
+                    window.draw(gameOverText);
+                    window.draw(winnerText);
+                }
+
                 window.display();
 
-                // Insert this block to let Stockfish play the local side in Singleplayer
-                //{
-                //    if (currentState == State::Game_Singleplayer && !gameOver) {
-                //        const bool engineSideIsWhite = (currentState == State::Game_BotMatch) ? true : isNetworkHost.load();
-                //        if (ChessPiece::whiteTurn == engineSideIsWhite) {
-                //            // Build FEN and get engine move
-                //            std::string fen = makeFEN(pieces);
-                //            std::string uci = stockfish.getBestMove(fen, 12);
-                //            int fromSq = -1, toSq = -1; char promo = 0;
-
-                //            if (!uci.empty() && uci != "(none)" && parseUciMove(uci, fromSq, toSq, promo)) {
-                //                // Locate the moving piece
-                //                ChessPiece* piece = nullptr;
-                //                for (auto& up : pieces) {
-                //                    if (up->getSquare() == fromSq && up->isWhite() == ChessPiece::whiteTurn) {
-                //                        piece = up.get();
-                //                        break;
-                //                    }
-                //                }
-                //                if (piece) {
-                //                    // Build current board state/pointers
-                //                    std::vector<int> bs(64, 0);
-                //                    std::vector<ChessPiece*> ptrs;
-                //                    for (auto& up : pieces) {
-                //                        int s = up->getSquare();
-                //                        if (s >= 0 && s < 64) { bs[s] = up->isWhite() ? 1 : -1; ptrs.push_back(up.get()); }
-                //                    }
-
-                //                    // Verify target is among pseudo-legal moves
-                //                    auto legal = piece->getPossibleMoves(bs);
-                //                    if (std::find(legal.begin(), legal.end(), toSq) != legal.end()) {
-                //                        // Resolve capture (normal or en passant)
-                //                        ChessPiece* targetEnemy = nullptr;
-                //                        bool isEnPassant = false;
-                //                        int victimSq = -1;
-
-                //                        if (piece->getType() == PieceType::Pawn &&
-                //                            toSq == ChessPiece::enPassantTargetSquare &&
-                //                            bs[toSq] == 0) {
-                //                            victimSq = toSq + (piece->isWhite() ? -8 : 8);
-                //                            for (auto& up : pieces) {
-                //                                if (up->getSquare() == victimSq &&
-                //                                    up->isWhite() != piece->isWhite() &&
-                //                                    up->getType() == PieceType::Pawn) {
-                //                                    targetEnemy = up.get();
-                //                                    isEnPassant = true;
-                //                                    break;
-                //                                }
-                //                            }
-                //                        }
-                //                        else {
-                //                            for (auto& up : pieces) {
-                //                                if (up->getSquare() == toSq && up->isWhite() != piece->isWhite()) {
-                //                                    targetEnemy = up.get();
-                //                                    break;
-                //                                }
-                //                            }
-                //                        }
-
-                //                        // Self-check guard
-                //                        const int from0 = piece->getSquare();
-                //                        piece->setSquare(toSq);
-                //                        int enemyOldSq = -1;
-                //                        if (targetEnemy) { enemyOldSq = targetEnemy->getSquare(); targetEnemy->setSquare(-1); }
-
-                //                        std::vector<int> simB(64, 0);
-                //                        std::vector<ChessPiece*> simPtrs;
-                //                        for (auto& up : pieces) {
-                //                            int s = up->getSquare();
-                //                            if (s >= 0 && s < 64) { simB[s] = up->isWhite() ? 1 : -1; simPtrs.push_back(up.get()); }
-                //                        }
-                //                        bool selfInCheck = CheckCheckmate::isInCheck(simB, simPtrs, piece->isWhite());
-
-                //                        // Restore
-                //                        piece->setSquare(from0);
-                //                        if (targetEnemy) targetEnemy->setSquare(enemyOldSq);
-
-                //                        if (!selfInCheck) {
-                //                            // Handle castling rook move
-                //                            if (piece->getType() == PieceType::King &&
-                //                                toRank(toSq) == toRank(from0) &&
-                //                                std::abs(toFile(toSq) - toFile(from0)) == 2) {
-                //                                bool kingSide = toFile(toSq) > toFile(from0);
-                //                                int rnk = toRank(from0);
-                //                                int rookFrom = toSquare(kingSide ? 7 : 0, rnk);
-                //                                int rookTo = toSquare(kingSide ? 5 : 3, rnk);
-                //                                for (auto& up : pieces) {
-                //                                    if (up->getSquare() == rookFrom &&
-                //                                        up->isWhite() == piece->isWhite() &&
-                //                                        up->getType() == PieceType::Rook) {
-                //                                        up->setSquare(rookTo);
-                //                                        up->setHasMoved(true);
-                //                                        break;
-                //                                    }
-                //                                }
-                //                            }
-
-                //                            // Apply capture
-                //                            if (targetEnemy) targetEnemy->setSquare(-1);
-
-                //                            // Move piece
-                //                            piece->setSquare(toSq);
-                //                            piece->setHasMoved(true);
-
-                //                            // En passant state for next turn
-                //                            ChessPiece::enPassantTargetSquare = -1;
-                //                            if (piece->getType() == PieceType::Pawn &&
-                //                                std::abs(toSq - from0) == 16) {
-                //                                ChessPiece::enPassantTargetSquare = (from0 + toSq) / 2;
-                //                            }
-
-                //                            // Promotion is handled by your existing promotion pass below:
-                //                            // Mark pawn off-board when it reaches last rank; the pass will spawn a Queen.
-                //                            if (piece->getType() == PieceType::Pawn) {
-                //                                int r = toRank(toSq);
-                //                                if ((piece->isWhite() && r == 7) || (!piece->isWhite() && r == 0)) {
-                //                                    piece->setSquare(-1);
-                //                                }
-                //                            }
-
-                //                            // Toggle turn
-                //                            ChessPiece::whiteTurn = !ChessPiece::whiteTurn;
-                //                        }
-                //                    }
-                //                    else if (uci == "(none)") {
-                //                        // No legal moves (checkmate/stalemate); let the existing end-of-frame logic detect/end the game
-                //                    }
-                //                }
-                //            }
-            sf::sleep(sf::milliseconds(1));
+                sf::sleep(sf::milliseconds(1));
+            }
+        }
         }
     }
-    }
-}

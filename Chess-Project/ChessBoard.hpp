@@ -14,7 +14,7 @@
 
 class ChessBoard {
 public:
-    void draw(sf::RenderWindow& surface, sf::Vector2u size);
+    void draw(sf::RenderWindow& surface, sf::Vector2u size, bool botInfo);
     void drawCircle(sf::RenderWindow& window, sf::Vector2u boardSize, float size, int offsetX, int squareIndex, sf::Color color);
     void drawRect(sf::RenderWindow& window, sf::Vector2u boardSize, float size, int offsetX, int squareIndex, sf::Color color);
 };

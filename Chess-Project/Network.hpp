@@ -2,6 +2,7 @@
 #include <iostream>
 #include <SFML/Network.hpp>
 #include <thread>
+#include <string>  // ADDED
 
 #include "json.hpp"
 
@@ -9,6 +10,9 @@ using json = nlohmann::json;
 
 extern std::atomic<bool> isNetworkHost;
 extern std::atomic<bool> isBotMatch; // NEW
+
+// ADDED: Global overlay buffer with the latest info received from the bot (client-side)
+extern std::string g_BotInfoOverlay;
 
 class networkManager {
 public:

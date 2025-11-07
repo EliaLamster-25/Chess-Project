@@ -2,6 +2,7 @@
 #include <iostream>
 #include <SFML/Graphics.hpp>
 #include <SFML/Graphics/RoundedRectangleShape.hpp>
+#include <SFML/System/Clock.hpp>
 
 Menu::Menu(sf::RenderWindow& window, sf::Vector2f size)
     : window(window),
@@ -38,7 +39,7 @@ Menu::Menu(sf::RenderWindow& window, sf::Vector2f size)
     singleplayerButton.setOutlineThickness(4.f);
     singleplayerButton.setOutlineColor(sf::Color(200, 200, 200));
     singleplayerButton.setPosition(sf::Vector2f(
-        windowSize.x / 2.f - singleplayerButton.getLocalBounds().size.x / 3.45,
+        windowSize.x / 2.f - singleplayerButton.getLocalBounds().size.x / 3.45f,
         windowSize.y / 2.f
     ));
 
@@ -46,15 +47,15 @@ Menu::Menu(sf::RenderWindow& window, sf::Vector2f size)
     multiplayerButton.setOutlineThickness(4.f);
     multiplayerButton.setOutlineColor(sf::Color(200, 200, 200));
     multiplayerButton.setPosition(sf::Vector2f(
-        windowSize.x / 2.f - multiplayerButton.getLocalBounds().size.x / 3.45,
-		windowSize.y / 2.f + 120.f
+        windowSize.x / 2.f - multiplayerButton.getLocalBounds().size.x / 3.45f,
+        windowSize.y / 2.f + 120.f
     ));
 
     botGameButton.setFillColor(sf::Color(60, 60, 60, 220));
     botGameButton.setOutlineThickness(4.f);
     botGameButton.setOutlineColor(sf::Color(200, 200, 200));
     botGameButton.setPosition(sf::Vector2f(
-        windowSize.x / 2.f - botGameButton.getLocalBounds().size.x / 3.45,
+        windowSize.x / 2.f - botGameButton.getLocalBounds().size.x / 3.45f,
         windowSize.y / 2.f + 240.f
     ));
 
@@ -96,18 +97,70 @@ Menu::Menu(sf::RenderWindow& window, sf::Vector2f size)
 }
 
 std::string Menu::mouseEvent(const sf::Event& event) {
+    // Long-press state for the Bot Match button
+    static bool botHoldActive = false;
+    static bool botHoldTriggered = false;
+    static sf::Clock botHoldClock;
+
+    auto tryTriggerBotHold = [&]() -> std::string {
+        if (botHoldActive && !botHoldTriggered && sf::Mouse::isButtonPressed(sf::Mouse::Button::Left)) {
+            sf::Vector2i pixel = sf::Mouse::getPosition(window);
+            sf::Vector2f worldPos = window.mapPixelToCoords(pixel);
+            // Must still be over the button
+            if (botGameButton.getGlobalBounds().contains(worldPos)) {
+                if (botHoldClock.getElapsedTime().asSeconds() >= 3.f) {
+                    botHoldTriggered = true;
+                    botHoldActive = false; // consume
+                    return "botVsBot";     // trigger immediately without waiting for release
+                }
+            } else {
+                // moved off the button — cancel hold
+                botHoldActive = false;
+                botHoldTriggered = false;
+            }
+        }
+        return "";
+    };
+
+    if (auto pressed = event.getIf<sf::Event::MouseButtonPressed>()) {
+        if (pressed->button == sf::Mouse::Button::Left) {
+            sf::Vector2f worldPos = window.mapPixelToCoords({ pressed->position.x, pressed->position.y });
+            if (botGameButton.getGlobalBounds().contains(worldPos)) {
+                botHoldActive = true;
+                botHoldTriggered = false;
+                botHoldClock.restart();
+            }
+        }
+    }
+
     if (auto released = event.getIf<sf::Event::MouseButtonReleased>()) {
         if (released->button == sf::Mouse::Button::Left) {
             sf::Vector2f worldPos = window.mapPixelToCoords({ released->position.x, released->position.y });
             if (singleplayerButton.getGlobalBounds().contains(worldPos)) {
+                botHoldActive = false;
+                botHoldTriggered = false;
                 return "singleplayer";
             }
             if (multiplayerButton.getGlobalBounds().contains(worldPos)) {
+                botHoldActive = false;
+                botHoldTriggered = false;
                 return "multiplayer";
             }
             if (botGameButton.getGlobalBounds().contains(worldPos)) {
-                return "botMatch";
+                // If a long hold already fired, ignore the short click fallback
+                if (!botHoldTriggered) {
+                    const float heldSeconds = botHoldClock.getElapsedTime().asSeconds();
+                    botHoldActive = false;
+                    botHoldTriggered = false;
+                    if (heldSeconds >= 3.f) {
+                        return "botVsBot"; // safety: in case the threshold was hit exactly on release
+                    }
+                    return "botMatch"; // short click
+                }
             }
+            // release elsewhere cancels
+            botHoldActive = false;
+            botHoldTriggered = false;
         }
     }
 
@@ -131,6 +184,16 @@ std::string Menu::mouseEvent(const sf::Event& event) {
         else {
             botGameButton.setFillColor(sf::Color(60, 60, 60, 220));
         }
+        // Cancel hold if cursor leaves while holding
+        if (botHoldActive && !botGameButton.getGlobalBounds().contains(worldPos)) {
+            botHoldActive = false;
+            botHoldTriggered = false;
+        }
+    }
+
+    // Check long-press threshold on any event to trigger immediately
+    if (auto action = tryTriggerBotHold(); !action.empty()) {
+        return action; // "botVsBot"
     }
 
     return "";

@@ -3,6 +3,7 @@
 #include <memory>
 #include <string_view>
 #include <SFML/Graphics.hpp>
+#include <SFML/System/Clock.hpp>
 #include <algorithm>
 #include <array>
 
@@ -27,12 +28,28 @@ void main()
 bool ChessPiece::whiteTurn = false;
 int ChessPiece::enPassantTargetSquare = -1;
 
+// Global clock for simple animation timing
+static sf::Clock gAnimClock;
+
 // Helper: map logical square to display square when horizontally flipped (mirror files only)
 static inline int mapSquare(int sq, bool flip) {
     if (!flip) return sq;
     int file = sq % 8;
     int rank = sq / 8;
     return rank * 8 + (7 - file);
+}
+
+sf::Vector2f ChessPiece::getCenterFromSquare(int sq, sf::Vector2u boardSize, int offsetX) {
+    int file = sq % 8;
+    int rank = sq / 8;
+    constexpr int kLabelPad = 28;
+    const float rectW = static_cast<float>((boardSize.y - 2 * kLabelPad) / 8);
+    const float rectH = rectW;
+    const float left = static_cast<float>(offsetX + kLabelPad);
+    const float top = static_cast<float>(kLabelPad);
+    const float squareX = left + rectW * file;
+    const float squareY = top + rectH * (7 - rank);
+    return { squareX + rectW / 2.f, squareY + rectH / 2.f };
 }
 
 ChessPiece::ChessPiece(bool isWhite, PieceType type, int square, const sf::Texture& texture)
@@ -43,7 +60,7 @@ ChessPiece::ChessPiece(bool isWhite, PieceType type, int square, const sf::Textu
 
     // Match board perspective: mirror horizontally for multiplayer client, never in botmatch
     bool flip = (!isNetworkHost.load(std::memory_order_acquire)
-                 && !isBotMatch.load(std::memory_order_acquire));
+        && !isBotMatch.load(std::memory_order_acquire));
     int disp = mapSquare(square, flip);
     int file = disp % 8;
     int rank = disp / 8;
@@ -55,30 +72,53 @@ ChessPiece::ChessPiece(bool isWhite, PieceType type, int square, const sf::Textu
     sprite.setScale(sf::Vector2f(0.5f, 0.5f));
 }
 
-void ChessPiece::draw(sf::RenderWindow& window, sf::Vector2u boardSize, int offsetX)
-{
-    const float rectW = static_cast<float>(boardSize.y) / 8.f;
-    const float rectH = rectW;
-    const float stepX = rectW * 0.95f;
-    const float stepY = rectH * 0.95f;
-    const float left  = offsetX * 1.06f;
-    const float top   = rectH * 0.20f;
+void ChessPiece::draw(sf::RenderWindow& window, sf::Vector2u boardSize, int offsetX) {
+    int sq = getSquare();
+    if (sq < 0 || sq >= 64) return;
 
-    // Use the same flip rule as the board so pieces align when mirrored
-    bool blackPerspective = (!isNetworkHost.load(std::memory_order_acquire)
-                             && !isBotMatch.load(std::memory_order_acquire));
-    const int displaySquare = mapSquare(square, blackPerspective);
+    constexpr int kLabelPad = 28;
+    const float rectW = static_cast<float>((boardSize.y - 2 * kLabelPad) / 8);
 
-    const int f = toFile(displaySquare);
-    const int r = toRank(displaySquare);
-    const float x = left + f * stepX;
-    const float y = top  + (7 - r) * stepY;
+    // Handle slide animation (interpolate position if sliding)
+    sf::Vector2f pos;
+    if (sliding) {
+        float t = slideClock.getElapsedTime().asSeconds() / std::max(0.0001f, slideDuration);
+        if (t >= 1.0f) {
+            t = 1.0f;
+            setSquare(slideToSquare);  // End slide
+            sliding = false;
+            slideDuration = 0.0f;
+            slideFromPixel = false;
+        }
+        // From: either drop pixel or center of from-square
+        const sf::Vector2f fromCenter = slideFromPixel
+            ? slideFromPos
+            : getCenterFromSquare(slideFromSquare, boardSize, offsetX);
+        const sf::Vector2f toCenter = getCenterFromSquare(slideToSquare, boardSize, offsetX);
+        pos = fromCenter + t * (toCenter - fromCenter);
+    } else {
+        pos = getCenterFromSquare(sq, boardSize, offsetX);  // Normal pos
+    }
 
-    const float cx = x + stepX / 2.f;
-    const float cy = y + stepY / 2.f;
+    // Compute base scale
+    float baseScale = (rectW * 0.6f) / 100.f;
+    if (getType() == PieceType::Queen || getType() == PieceType::King) {
+        baseScale = (rectW * 0.7f) / 100.f;
+    }
 
-    sprite.setPosition({cx, cy});
-    window.draw(sprite);
+    // Scale tween
+    if (scaleDuration > 0.0f) {
+        float t = scaleClock.getElapsedTime().asSeconds() / std::max(0.0001f, scaleDuration);
+        t = std::min(1.0f, t);
+        currentScale = startScale + t * (targetScale - startScale);
+        if (t >= 1.0f) scaleDuration = 0.0f;
+    } else {
+        currentScale = baseScale;
+    }
+
+    getSprite().setPosition(pos);
+    getSprite().setScale(sf::Vector2f(currentScale, currentScale));
+    window.draw(getSprite());
 }
 
 void ChessPiece::setSquare(int sq) { square = sq; }
@@ -154,6 +194,7 @@ void ChessPiece::drawPieceWithGlow(sf::RenderWindow& window,
 
     sf::RenderTexture rt(sf::Vector2u(rtW, rtH));
     rt.clear(sf::Color::Transparent);
+    rt.setSmooth(true);
 
     const sf::Vector2f rtCenter(rtW * 0.5f, rtH * 0.5f);
 
@@ -163,7 +204,6 @@ void ChessPiece::drawPieceWithGlow(sf::RenderWindow& window,
     s.setPosition(rtCenter);
 
     sf::RenderStates glowStates;
-    // Use alpha blending to avoid additive brightening/whitening in the center
     glowStates.blendMode = sf::BlendAlpha;
     if (shaderLoaded) {
         glowStates.shader = &glowShader;
@@ -173,7 +213,6 @@ void ChessPiece::drawPieceWithGlow(sf::RenderWindow& window,
     constexpr int dirCount = 32;
     const float twoPi = 2.0f * PI;
 
-    // Clamp and use a uniform alpha across all rings (no Gaussian ramp)
     minAlphaFraction = std::clamp(minAlphaFraction, 0.0f, 1.0f);
     const float uniformWeight = (minAlphaFraction > 0.0f) ? minAlphaFraction : 1.0f;
 
@@ -208,7 +247,7 @@ void ChessPiece::drawPieceWithGlow(sf::RenderWindow& window,
     halo.setOrigin(sf::Vector2f(rtW * 0.5f, rtH * 0.5f));
     halo.setPosition(sprite.getPosition());
     halo.setScale(sf::Vector2f(1.0f, 1.0f));
-
+   
     sf::RenderStates haloStates;
     haloStates.blendMode = sf::BlendAlpha;
     window.draw(halo, haloStates);
@@ -216,5 +255,43 @@ void ChessPiece::drawPieceWithGlow(sf::RenderWindow& window,
     window.draw(sprite);
 }
 
-ChessPiece::~ChessPiece() = default;
+void ChessPiece::startScaleAnimation(float fromScale, float toScale, float duration) {
+    startScale   = fromScale;
+    currentScale = fromScale;
+    targetScale  = toScale;
+    scaleDuration = duration;
+    scaleClock.restart();
+}
 
+void ChessPiece::tickScaleOnly() {
+    if (scaleDuration > 0.0f) {
+        float t = scaleClock.getElapsedTime().asSeconds() / std::max(0.0001f, scaleDuration);
+        if (t >= 1.0f) {
+            t = 1.0f;
+            currentScale = startScale + t * (targetScale - startScale);
+            scaleDuration = 0.0f;
+        } else {
+            currentScale = startScale + t * (targetScale - startScale);
+        }
+    }
+    sprite.setScale(sf::Vector2f(currentScale, currentScale));
+}
+
+void ChessPiece::beginSlide(int fromSq, int toSq, float duration) {
+    slideFromSquare = fromSq;
+    slideToSquare   = toSq;
+    slideDuration   = duration;
+    sliding         = true;
+
+    // Start from the current pixel position (mouse drop), not the logical from-square center
+    slideFromPos    = sprite.getPosition();
+    slideFromPixel  = true;
+
+    slideClock.restart();
+}
+
+bool ChessPiece::isSliding() const {
+    return sliding;
+}
+
+ChessPiece::~ChessPiece() = default;

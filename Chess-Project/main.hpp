@@ -29,6 +29,7 @@
 #include "mainMenu.hpp"
 #include "json.hpp"
 #include "Network.hpp"
+#include "botOverlay.hpp"
 
 using json = nlohmann::json;
 

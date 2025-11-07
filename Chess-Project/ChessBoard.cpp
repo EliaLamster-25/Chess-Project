@@ -1,12 +1,12 @@
 #include "ChessBoard.hpp"
+#include "Network.hpp"
 
 namespace {
     inline int logicalToDisplaySquare(int sq, bool blackPerspective) {
-        // Horizontal mirror: same rank, file' = 7 - file
         if (!blackPerspective) return sq;
         int file = sq % 8;
         int rank = sq / 8;
-        return rank * 8 + (7 - file);
+        return (7 - rank) * 8 + (7 - file);  // Full 180: flip both rank and file
     }
     inline int logicalFile(int sq) { return sq % 8; }
     inline int logicalRank(int sq) { return sq / 8; }
@@ -112,7 +112,7 @@ namespace {
 
         // Files
         for (int displayFile = 0; displayFile < 8; ++displayFile) {
-            // Make bottom perspective always a-h left->right for the side at bottom.
+            // Make bottom perspective always a-h left->right for the side at bottom, but mirrored for black (h left, a right)
             int fileLetterIndex = blackPerspective ? (7 - displayFile) : displayFile;
             char fileChar = static_cast<char>('a' + fileLetterIndex);
             std::string fileStr(1, fileChar);
@@ -142,7 +142,7 @@ namespace {
         // Ranks
         for (int displayRank = 0; displayRank < 8; ++displayRank) {
             int rankNumberIndex = displayRank; // horizontal flip keeps rank order
-            int rankNum = rankNumberIndex + 1;
+            int rankNum = blackPerspective ? (8 - displayRank) : (displayRank + 1);
             std::string rankStr = std::to_string(rankNum);
 
             sf::Text left(font, rankStr);
@@ -170,7 +170,7 @@ namespace {
 
 } // namespace
 
-void ChessBoard::draw(sf::RenderWindow& surface, sf::Vector2u size) {
+void ChessBoard::draw(sf::RenderWindow& surface, sf::Vector2u size, bool botInfo) {
     constexpr int LabelPad = 28;
 
     const int RectHeight = static_cast<int>((static_cast<int>(size.y) - 2 * LabelPad) / 8);
@@ -178,16 +178,16 @@ void ChessBoard::draw(sf::RenderWindow& surface, sf::Vector2u size) {
     const int OffsetX    = static_cast<int>(size.x / 4);
 
     static sf::Font coordFont;
-    static bool fontLoaded = false;
-    //if (!fontLoaded) {
-    //    if (!coordFont.openFromFile("assets/segoeuithibd.ttf")) {
-    //        std::cerr << "Failed to load coordinate font\n";
-    //    }
-    //    fontLoaded = true;
-    //}
-    if (!coordFont.openFromMemory(segoeuithibd_ttf, segoeuithibd_ttf_len)) {
-        std::cerr << "Failed to load Segoe UI font from memory\n";
-        fontLoaded = true;
+    static bool fontReady = false;
+
+    // Load the font once; do NOT reload every frame
+    if (!fontReady) {
+        if (!coordFont.openFromMemory(segoeuithibd_ttf, segoeuithibd_ttf_len)) {
+            std::cerr << "Failed to load Segoe UI font from memory\n";
+            fontReady = false;
+        } else {
+            fontReady = true;
+        }
     }
 
     static BoardCache cache;
@@ -197,16 +197,20 @@ void ChessBoard::draw(sf::RenderWindow& surface, sf::Vector2u size) {
                              && !isBotMatch.load(std::memory_order_acquire));
 
     if (paramsChanged(cache, RectWidth, RectHeight, OffsetX, LabelPad, blackPerspective)) {
+        // Rebuild cache geometry and labels. Labels rely on coordFont; it's safe because we load once.
         buildBoardCache(cache, coordFont, RectWidth, RectHeight, OffsetX, LabelPad, blackPerspective);
     }
 
     surface.draw(cache.background);
     surface.draw(cache.squares);
 
-    for (auto& t : cache.fileLabelsBottom) surface.draw(t);
-    for (auto& t : cache.fileLabelsTop)    surface.draw(t);
-    for (auto& t : cache.rankLabelsLeft)   surface.draw(t);
-    for (auto& t : cache.rankLabelsRight)  surface.draw(t);
+    // Draw labels only if the font is valid
+    if (fontReady) {
+        for (auto& t : cache.fileLabelsBottom) surface.draw(t);
+        for (auto& t : cache.fileLabelsTop)    surface.draw(t);
+        for (auto& t : cache.rankLabelsLeft)   surface.draw(t);
+        for (auto& t : cache.rankLabelsRight)  surface.draw(t);
+    }
 }
 
 static inline sf::Vector2f squareCenter(sf::Vector2u boardSize,
@@ -220,7 +224,6 @@ static inline sf::Vector2f squareCenter(sf::Vector2u boardSize,
     int displaySq = logicalToDisplaySquare(squareIndex, blackPerspective);
     int file = logicalFile(displaySq);
     int rank = logicalRank(displaySq);
-
     float baseX = static_cast<float>(offsetX + LabelPad);
     float baseY = static_cast<float>(LabelPad);
     float squareX = baseX + static_cast<float>(rectW * file);

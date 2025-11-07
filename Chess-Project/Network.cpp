@@ -7,7 +7,49 @@
 #include "Network.hpp"
 
 std::atomic<bool> isNetworkHost{ false };
-std::atomic<bool> isBotMatch{ false }; // NEW
+std::atomic<bool> isBotMatch{ false };
+
+namespace {
+    inline std::string trim(const std::string& s) {
+        const auto l = s.find_first_not_of(" \t\r\n");
+        if (l == std::string::npos) return {};
+        const auto r = s.find_last_not_of(" \t\r\n");
+        return s.substr(l, r - l + 1);
+    }
+
+    // Accepts:
+    // - "e2e4" or "e7e8q"
+    // - "bestmove e2e4" (with optional "ponder ...")
+    // Returns normalized lowercase promotion, e.g., "e7e8q".
+    bool tryExtractUCIMove(const std::string& in, std::string& outMove) {
+        std::string s = trim(in);
+
+        // If it starts with "bestmove ", strip and take the first token after it
+        if (s.rfind("bestmove ", 0) == 0 && s.size() > 9) {
+            s = s.substr(9);
+            auto space = s.find(' ');
+            if (space != std::string::npos) s = s.substr(0, space);
+        }
+
+        // Raw UCI format: from(2) + to(2) + optional promo(1)
+        if (s.size() == 4 || s.size() == 5) {
+            auto file = [](char c) { return c >= 'a' && c <= 'h'; };
+            auto rank = [](char c) { return c >= '1' && c <= '8'; };
+            if (file(s[0]) && rank(s[1]) && file(s[2]) && rank(s[3])) {
+                if (s.size() == 5) {
+                    char p = s[4];
+                    // normalize to lowercase
+                    if (p >= 'A' && p <= 'Z') p = char(p - 'A' + 'a');
+                    if (!(p == 'q' || p == 'r' || p == 'b' || p == 'n')) return false;
+                    s[4] = p;
+                }
+                outMove = s;
+                return true;
+            }
+        }
+        return false;
+    }
+}
 
 void networkManager::start(std::string mode) {
     std::cout << "Network\n";
@@ -55,10 +97,10 @@ bool networkManager::searchForServer(bool botMatch) {
     auto startTime = std::chrono::steady_clock::now();
     std::chrono::milliseconds searchTimeout;
     if (botMatch) {
-        searchTimeout = std::chrono::seconds(60); // 1 second search
+        searchTimeout = std::chrono::seconds(30); // 30 seconds search
     }
     else {
-        searchTimeout = std::chrono::milliseconds(1000); // 1 minute search
+        searchTimeout = std::chrono::seconds(10); // 2 minute search
     }
 
     auto nextDotTime = startTime + std::chrono::seconds(5);
@@ -264,20 +306,84 @@ int networkManager::receiveFromClient(json& outMessage) {
 int networkManager::receiveFromHost(json& outMessage) {
     if (isNetworkHost || !clientConnected) return 0;
 
-    sf::Packet packet;
-    sf::Socket::Status status = clientSocket.receive(packet);
-    if (status == sf::Socket::Status::Done) {
-        std::string payload;
-        if (!(packet >> payload)) return -2;
-        json parsed = json::parse(payload, nullptr, false);
-        if (parsed.is_discarded()) return -2;
-        outMessage = parsed;
-        std::cout << "Received from host: " << payload << "\n";
-        return 1;
-    } else if (status == sf::Socket::Status::Disconnected) {
-        std::cout << "Host disconnected\n";
-        clientConnected = false;
-        return -1;
+    for (;;) {
+        sf::Packet packet;
+        sf::Socket::Status status = clientSocket.receive(packet);
+
+        if (status == sf::Socket::Status::Done) {
+            std::string payload;
+            if (!(packet >> payload)) {
+                continue;
+            }
+
+            // 1) Try JSON first
+            json parsed = json::parse(payload, nullptr, false);
+            if (!parsed.is_discarded()) {
+                // Normalize move if present in structured JSON
+                std::string move;
+                auto typeIt = parsed.find("type");
+                if (typeIt != parsed.end() && typeIt->is_string()) {
+                    const std::string t = *typeIt;
+                    if (t == "move") {
+                        if (parsed.contains("uci") && parsed["uci"].is_string() &&
+                            tryExtractUCIMove(parsed["uci"].get<std::string>(), move)) {
+                            outMessage = json{ {"type","move"}, {"uci", move} };
+                            std::cout << "Received from host: " << outMessage.dump() << "\n";
+                            return 1;
+                        }
+                    }
+                    else if (t == "bestmove") {
+                        // Accept {"type":"bestmove","uci":"e2e4"} or {"type":"bestmove","move":"e2e4"}
+                        const std::string key = parsed.contains("uci") ? "uci" : (parsed.contains("move") ? "move" : "");
+                        if (!key.empty() && parsed[key].is_string() &&
+                            tryExtractUCIMove(parsed[key].get<std::string>(), move)) {
+                            outMessage = json{ {"type","move"}, {"uci", move} };
+                            std::cout << "Received from host: " << outMessage.dump() << "\n";
+                            return 1;
+                        }
+                    }
+                    else if (t == "engine_stats") {
+                        // Some engines emit bestmove as a string line
+                        if (parsed.contains("string") && parsed["string"].is_string() &&
+                            tryExtractUCIMove(parsed["string"].get<std::string>(), move)) {
+                            outMessage = json{ {"type","move"}, {"uci", move} };
+                            std::cout << "Received from host: " << outMessage.dump() << "\n";
+                            return 1;
+                        }
+
+                        // Ignore lightweight info strings with no PV/score/move
+                        const bool isJustInfoString =
+                            parsed.contains("string") && !parsed.contains("pv") && !parsed.contains("score");
+                        if (isJustInfoString) {
+                            continue;
+                        }
+                    }
+                }
+
+                // No move found but valid JSON: return it (keeps previous behavior)
+                outMessage = parsed;
+                std::cout << "Received from host: " << payload << "\n";
+                return 1;
+            }
+
+            // 2) Not JSON: try to parse raw UCI or "bestmove e2e4"
+            std::string move;
+            if (tryExtractUCIMove(payload, move)) {
+                outMessage = json{ {"type","move"}, {"uci", move} };
+                std::cout << "Received from host: " << outMessage.dump() << "\n";
+                return 1;
+            }
+
+            // Unknown non-JSON payload; ignore and keep draining
+            continue;
+        }
+        else if (status == sf::Socket::Status::Disconnected) {
+            std::cout << "Host disconnected\n";
+            clientConnected = false;
+            return -1;
+        }
+        else {
+            return 0; // NotReady/Error: nothing more right now
+        }
     }
-    return 0;
 }
