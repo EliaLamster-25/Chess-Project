@@ -14,6 +14,9 @@ extern std::atomic<bool> isBotMatch; // NEW
 // ADDED: Global overlay buffer with the latest info received from the bot (client-side)
 extern std::string g_BotInfoOverlay;
 
+// ADDED: Allow network layer to mark the game as over on disconnects
+extern bool gameOver;
+
 class networkManager {
 public:
     // Establish connection (client) or host a listener (server fallback)
@@ -26,6 +29,10 @@ public:
 
     int receiveFromClient(json& outMessage);
     int receiveFromHost(json& outMessage);
+
+    bool isConnected() const noexcept {
+        return clientConnected;
+    }
 
 private:
     sf::TcpSocket      clientSocket;

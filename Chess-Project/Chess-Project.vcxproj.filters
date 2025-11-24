@@ -117,6 +117,12 @@
     <ClCompile Include="stockfish.cpp">
       <Filter>Resource Files\Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="botOverlay.cpp">
+      <Filter>Resource Files\Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="engineSelection.cpp">
+      <Filter>Resource Files\Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ChessBoard.hpp">
@@ -219,6 +225,12 @@
       <Filter>Assets\chessPieces</Filter>
     </ClInclude>
     <ClInclude Include="stockfish.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="botOverlay.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="engineSelection.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

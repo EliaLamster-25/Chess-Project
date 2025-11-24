@@ -3,6 +3,7 @@
 #include <SFML/Network.hpp>
 #include <SFML/Network/IpAddress.hpp>
 #include <optional>
+#include <cstdio>
 
 #include "Network.hpp"
 
@@ -48,6 +49,18 @@ namespace {
             }
         }
         return false;
+    }
+
+    std::optional<sf::IpAddress> parseIpv4(const std::string& s) {
+        unsigned int a, b, c, d;
+        char trailing;
+        // Ensure only exactly a.b.c.d (no extra chars)
+        if (sscanf_s(s.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &trailing, 1) == 4) {
+            if (a < 256 && b < 256 && c < 256 && d < 256) {
+                return sf::IpAddress(a, b, c, d); // uses 4-integer ctor
+            }
+        }
+        return std::nullopt;
     }
 }
 
@@ -140,16 +153,6 @@ bool networkManager::searchForServer(bool botMatch) {
                     isNetworkHost.store(false, std::memory_order_release);
                     clientConnected = true;
                     clientSocket.setBlocking(false);
-
-                    // Try to receive greeting
-                    sf::Packet packet;
-                    sf::Socket::Status rcvStatus = clientSocket.receive(packet);
-                    if (rcvStatus == sf::Socket::Status::Done) {
-                        std::string payload;
-                        if (packet >> payload) {
-                            std::cout << "Received greeting from server: " << payload << "\n";
-                        }
-                    }
 
                     std::cout << "Successfully connected to server: " << sender.value().toString() << "\n";
                     return true;
@@ -259,6 +262,13 @@ int networkManager::sendToClient(const json& message) {
     } else if (st == sf::Socket::Status::NotReady) {
         std::cout << "Send to client blocked (NotReady)\n";
         return 0;
+    } else if (st == sf::Socket::Status::Disconnected) {
+        std::cout << "Client disconnected during send\n";
+        clientConnected = false;
+        if (!isBotMatch.load(std::memory_order_acquire)) {
+            gameOver = true;
+        }
+        return 0;
     }
     std::cout << "Failed sending to client (status=" << static_cast<int>(st) << ")\n";
     return 0;
@@ -277,6 +287,13 @@ int networkManager::sendToHost(const json& message) {
         return 1;
     } else if (st == sf::Socket::Status::NotReady) {
         std::cout << "Send to host blocked (NotReady)\n";
+        return 0;
+    } else if (st == sf::Socket::Status::Disconnected) {
+        std::cout << "Host disconnected during send\n";
+        clientConnected = false;
+        if (!isBotMatch.load(std::memory_order_acquire)) {
+            gameOver = true;
+        }
         return 0;
     }
     std::cout << "Failed sending to host (status=" << static_cast<int>(st) << ")\n";
@@ -298,6 +315,9 @@ int networkManager::receiveFromClient(json& outMessage) {
     } else if (status == sf::Socket::Status::Disconnected) {
         std::cout << "Client disconnected\n";
         clientConnected = false;
+        if (!isBotMatch.load(std::memory_order_acquire)) {
+            gameOver = true;
+        }
         return -1;
     }
     return 0;
@@ -330,6 +350,29 @@ int networkManager::receiveFromHost(json& outMessage) {
                             outMessage = json{ {"type","move"}, {"uci", move} };
                             std::cout << "Received from host: " << outMessage.dump() << "\n";
                             return 1;
+                        }
+                    }
+                    else if (t == "redirect") {
+                        std::cout << "connection refused, forwarded to different server"<< "\n";
+                        clientSocket.setBlocking(true);
+                        const std::string hostStr = parsed["host"].get<std::string>();
+                        auto ipOpt = parseIpv4(hostStr);
+                        if (!ipOpt) {
+                            std::cout << "Invalid IPv4 address in redirect: " << hostStr << "\n";
+                            return 0;
+                        }
+                        sf::IpAddress ip = *ipOpt;
+                        sf::Socket::Status connectStatus = clientSocket.connect(ip, parsed["port"], sf::milliseconds(2000));
+
+                        if (connectStatus == sf::Socket::Status::Done) {
+                            isNetworkHost.store(false, std::memory_order_release);
+                            clientConnected = true;
+                            clientSocket.setBlocking(false);
+                            std::cout << "Successfully rerouted to server: " << ip << "port: " << parsed["port"] << "\n";
+                            return true;
+                        }
+                        else {
+                            std::cout << "Found server but failed to connect (status=" << static_cast<int>(connectStatus) << ")\n";
                         }
                     }
                     else if (t == "bestmove") {
@@ -380,6 +423,9 @@ int networkManager::receiveFromHost(json& outMessage) {
         else if (status == sf::Socket::Status::Disconnected) {
             std::cout << "Host disconnected\n";
             clientConnected = false;
+            if (!isBotMatch.load(std::memory_order_acquire)) {
+                gameOver = true;
+            }
             return -1;
         }
         else {
